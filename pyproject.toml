@@ -1,0 +1,18 @@
+[project]
+name = "first_word"
+version = "0.1.0"
+description = "Астра сама начинает разговор: приветствие, ночь, молчание, возврат к теме."
+requires-python = ">=3.10"
+dependencies = [
+    "astra-plugin-sdk>=0.5,<0.6",
+    "grpcio>=1.60.0",
+    "protobuf>=4.25.0",
+]
+
+[project.optional-dependencies]
+# `pip install -e ".[dev]"`, then `pytest`. The harness itself ships in the SDK,
+# so this extra adds the runner and nothing else.
+dev = ["pytest>=7.0"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

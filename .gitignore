@@ -1,0 +1,14 @@
+# Build artifacts
+*.astraplugin
+
+__pycache__/
+*.pyc
+.venv/
+requirements.lock
+
+# Состояние плагина у пользователя: заметки о разговорах и счётчики
+data/
+
+# Окружение, которое Astra создаёт сама
+.astra-venv.json
+.pytest_cache/

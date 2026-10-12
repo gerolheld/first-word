@@ -1,0 +1,52 @@
+[plugin]
+id = "first-word"
+name = "Инициатива Астры"
+version = "0.1.0"
+description = "Астра сама начинает разговор: утреннее приветствие, напоминание про ночь, возврат к вчерашней теме."
+author = "gerolheld"
+license = "MIT"
+
+[entry]
+command = "python"
+args = ["-m", "src.plugin"]
+runtimes = ["python"]
+
+[capabilities]
+tools = true
+event_handlers = true
+
+[permissions]
+subscribe_events = { types = ["state_changed", "lock_state_changed", "speech_recognized", "chat_message", "tts_started", "tts_completed", "tts_interrupted"], reason = "Понимает, что вы за компьютером, и молчит, пока идёт разговор, Астра говорит или экран заблокирован." }
+send_chat_message = { reason = "Просит Астру самой начать разговор: отвечает её модель, голосом и характером." }
+
+[platform]
+os = ["linux", "windows"]
+arch = ["x86_64"]
+
+[config]
+schema = """
+{
+  "type": "object",
+  "properties": {
+    "enable_morning": { "type": "boolean", "default": true, "title": "Утреннее приветствие", "description": "Первая активность за день после заданного часа или разблокировка экрана утром." },
+    "morning_hour": { "type": "integer", "minimum": 0, "maximum": 23, "default": 8, "title": "Утро начинается с (час)" },
+    "morning_until": { "type": "integer", "minimum": 1, "maximum": 24, "default": 12, "title": "Здороваться не позже (час)", "description": "Если первая активность позже, приветствия не будет." },
+    "enable_callback": { "type": "boolean", "default": true, "title": "Возврат к теме", "description": "Спросить, чем закончилось то, что обсуждали вчера. Идёт вместе с утренним приветствием." },
+    "enable_night": { "type": "boolean", "default": true, "title": "Полуночник", "description": "Мягко предложить закругляться, если вы активны поздно ночью." },
+    "night_hour": { "type": "integer", "minimum": 0, "maximum": 23, "default": 1, "title": "Ночь начинается с (час)", "description": "Окно длится 7 часов. Тихие часы сильнее него." },
+    "enable_silence": { "type": "boolean", "default": true, "title": "Долгое молчание", "description": "Вы за компьютером (экран не заблокирован), но давно не общались с Астрой." },
+    "silence_hours": { "type": "integer", "minimum": 1, "maximum": 48, "default": 3, "title": "Порог молчания (часов)" },
+    "enable_random": { "type": "boolean", "default": true, "title": "Случайная мысль", "description": "Редко: Астра делится мыслью или вопросом." },
+    "random_chance_percent": { "type": "integer", "minimum": 0, "maximum": 100, "default": 40, "title": "Шанс случайной мысли в день (%)" },
+    "daily_limit": { "type": "integer", "minimum": 0, "maximum": 20, "default": 4, "title": "Инициатив в день, не больше", "description": "Каждая инициатива — один запрос к модели." },
+    "min_interval_min": { "type": "integer", "minimum": 0, "maximum": 1440, "default": 90, "title": "Минимум между инициативами (минут)" },
+    "quiet_enabled": { "type": "boolean", "default": true, "title": "Тихие часы" },
+    "quiet_start": { "type": "integer", "minimum": 0, "maximum": 23, "default": 3, "title": "Тихие часы с (час)" },
+    "quiet_end": { "type": "integer", "minimum": 0, "maximum": 23, "default": 8, "title": "Тихие часы до (час)" },
+    "after_chat_pause_min": { "type": "integer", "minimum": 0, "maximum": 120, "default": 3, "title": "Пауза после разговора (минут)", "description": "Столько плагин молчит после последней реплики в чате." },
+    "speak_aloud": { "type": "boolean", "default": true, "title": "Озвучивать" },
+    "character": { "type": "string", "maxLength": 600, "default": "", "title": "Характер", "description": "Свободный текст о том, как Астра должна заводить разговор: тон, манера, о чём любит спрашивать." },
+    "dry_run": { "type": "boolean", "default": false, "title": "Пробный режим", "description": "Ничего не отправлять модели, только записывать в журнал, что было бы сказано." }
+  }
+}
+"""
