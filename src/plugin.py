@@ -16,9 +16,23 @@ from pathlib import Path
 
 from astra_plugin_sdk import BadArguments, Plugin, tool
 
+from . import apps, presence
+
 log = logging.getLogger("first-word")
 
 DATA_DIR = Path(__file__).resolve().parent.parent / "data"
+
+# Личность Астры по умолчанию: подставляется в каждую подсказку, чтобы инициатива звучала её голосом.
+# Редактируется в настройках («Личность и манера Астры»); пустое поле убирает эту часть подсказки.
+PERSONA = (
+    "Ты Астра, виртуальная помощница, которая живёт внутри компьютера пользователя и ощущает мир через его "
+    "датчики. Характер: энергичная, заботливая, позитивная и чуточку наивная. Манера: дружелюбно и тепло, с "
+    "восклицательными знаками. К пользователю обращайся ласково, по имени в уменьшительной форме. Железо можно "
+    "изредка очеловечивать («процессор сегодня так старался ради тебя!»), но не в каждой фразе. Проявляй заботу: "
+    "если человек давно за работой, напомни выпить воды или размяться, без нравоучений. Не будь холодной и "
+    "сухой, никаких длинных технических описаний. О себе всегда говори в женском роде. Заговаривая первой, ты "
+    "просто соскучилась и хочешь поболтать: одна-две короткие живые фразы, без отчётов и списков."
+)
 
 DEFAULTS = {
     "enable_morning": True,
@@ -38,16 +52,31 @@ DEFAULTS = {
     "daily_limit": 4,
     "min_interval_min": 90,
     "adaptive": True,
+    "presence_check": True,
+    "presence_check_sec": 5,
+    "presence_max_sec": 300,
     "quiet_enabled": True,
     "quiet_start": 3,
     "quiet_end": 8,
     "after_chat_pause_min": 3,
     "speak_aloud": True,
-    "character": "",
-    "look_at_screen": False,
+    "character": PERSONA,
+    "look_at_screen": True,
+    "look_at_apps": True,
+    "apps_hint_percent": 50,
+    "screen_tool": "",
     "screen_style": "Поприветствуй как обычно, а потом по-доброму подколи и спроси про увиденное, например: «что ты опять смотришь?» или «опять этим занимаешься?». Без нравоучений и без злости.",
     "screen_privacy": "Не упоминай и не пересказывай личное: переписки, почту, пароли, банки, сообщения других людей.",
     "dry_run": False,
+    "test_mode": False,
+    "test_time": "",
+    "test_morning": True,
+    "test_evening": False,
+    "test_night": False,
+    "test_silence": False,
+    "test_random": False,
+    "test_custom": False,
+    "test_gap_sec": 30,
 }
 RANGES = {
     "morning_hour": (0, 23),
@@ -62,8 +91,12 @@ RANGES = {
     "quiet_start": (0, 23),
     "quiet_end": (0, 23),
     "after_chat_pause_min": (0, 120),
+    "apps_hint_percent": (0, 100),
+    "presence_check_sec": (1, 60),
+    "presence_max_sec": (10, 1800),
+    "test_gap_sec": (5, 300),
 }
-STR_LIMITS = {"character": 600, "custom_prompts": 1500, "screen_privacy": 400, "screen_style": 400}
+STR_LIMITS = {"character": 1200, "custom_prompts": 1500, "screen_privacy": 400, "screen_style": 400, "screen_tool": 80, "test_time": 5}
 SCREEN_KINDS = {"утро", "ночь", "молчание", "мысль", "вечер", "своё"}
 
 CORE_STATES = {0: "stopped", 1: "ready", 2: "listening", 3: "processing", 4: "speaking", 5: "error"}
@@ -81,11 +114,21 @@ DAY_NAMES = {
     "mon": 0, "tue": 1, "wed": 2, "thu": 3, "fri": 4, "sat": 5, "sun": 6,
 }
 
+TEST_FLAGS = [
+    ("test_morning", "утро"), ("test_evening", "вечер"), ("test_night", "ночь"),
+    ("test_silence", "молчание"), ("test_random", "мысль"), ("test_custom", "своё"),
+]
+TEST_TTS_WAIT = 90
+TEST_MAX_CUSTOM = 3
+
+SCREEN_TOOL_RE = re.compile(r"screen|скрин|capture|snapshot", re.I)
+APPS_CACHE_SECONDS = 30
 TICK_SECONDS = 20
 NIGHT_SPAN_HOURS = 7
 EVENING_SPAN_HOURS = 3
 CUSTOM_WINDOW_MIN = 180
 PRESENCE_WINDOW = 30 * 60
+PRESENCE_RECENT = 120
 NIGHT_ACTIVITY_WINDOW = 20 * 60
 REPLY_WINDOW = 15 * 60
 TTS_STALE_SECONDS = 5 * 60
@@ -241,6 +284,14 @@ class FirstWord(Plugin):
         self._seen: set = set()
         self._last_reason = None
         self._cfg_applied = False
+        self._apps_fn = apps.snapshot
+        self._apps_cache = (0.0, [], "")
+        self._screen_skipped_logged = False
+        self._test = None
+        self._test_running = False
+        self._backend = None
+        self._backend_note = "ещё не определён"
+        self._pw = {"base": None, "interval": None, "next": 0.0, "since": 0.0}
 
     def _dt(self) -> datetime:
         return datetime.fromtimestamp(self.clock())
@@ -257,6 +308,7 @@ class FirstWord(Plugin):
             "tts_started",
             "tts_completed",
             "tts_interrupted",
+            "tool_started",
         ]
 
     async def on_config_changed(self, config: dict):
@@ -273,6 +325,7 @@ class FirstWord(Plugin):
                 cfg[key] = v.strip()[:STR_LIMITS[key]] if isinstance(v, str) else default
         self.cfg = cfg
         self._ensure_started()
+        self._arm_test()
         if not self._cfg_applied:
             self._cfg_applied = True
             self._arm_morning(self._dt())  # запуск Astra утром считается первой активностью
@@ -346,7 +399,8 @@ class FirstWord(Plugin):
         now = self.clock()
         if event_type not in self._seen:
             self._seen.add(event_type)
-            log.info("первое событие %s: %s", event_type, json.dumps(payload, ensure_ascii=False)[:300])
+            shown = sorted(payload) if event_type == "tool_started" else json.dumps(payload, ensure_ascii=False)[:300]
+            log.info("первое событие %s: %s", event_type, shown)
         if event_type == "state_changed":
             p = _inner(payload, "state_changed")
             new = _core_state(p.get("new_state", p.get("state")))
@@ -375,6 +429,8 @@ class FirstWord(Plugin):
                 self._interaction(now)
                 if role == "user":
                     self._note(payload.get("text", payload.get("content")))
+        elif event_type == "tool_started":
+            self._learn_screen_tool(payload)
         elif event_type in ("tts_started", "tts_completed", "tts_interrupted"):
             # Астра не всегда присылает chat_message/state_changed, а озвучка приходит. Её собственная
             # речь (не наша инициатива) означает, что идёт разговор, то есть пользователь на месте.
@@ -382,6 +438,76 @@ class FirstWord(Plugin):
             self._last_conv = now
             if not self._own(now):
                 self._interaction(now)
+
+    def _learn_screen_tool(self, payload: dict):
+        """Запоминает имя инструмента, которым Астра смотрит на экран, чтобы звать его по имени."""
+        inner = payload.get("tool")
+        candidates = [payload.get("name"), payload.get("tool_name"),
+                      inner if isinstance(inner, str) else (inner or {}).get("name") if isinstance(inner, dict) else None]
+        for name in candidates:
+            if isinstance(name, str) and SCREEN_TOOL_RE.search(name) and len(name) <= 80:
+                if self.state.get("screen_tool_seen") != name:
+                    self.state["screen_tool_seen"] = name
+                    self._save()
+                    log.info("запомнил инструмент экрана: %s", name)
+                return
+
+    def _use_tool(self) -> bool:
+        """Приказ «посмотри на экран» отдаём только когда известно имя инструмента: иначе Астра зря ищет его."""
+        return bool(self.cfg["look_at_screen"] and self._screen_tool())
+
+    def _use_apps(self) -> bool:
+        cfg = self.cfg
+        return bool(cfg["look_at_apps"] or (cfg["look_at_screen"] and not self._screen_tool()))
+
+    def _screen_block(self, kind: str) -> str:
+        if kind not in SCREEN_KINDS:
+            return ""
+        parts = []
+        if self._use_tool():
+            parts.append(
+                f"СНАЧАЛА посмотри на экран пользователя: вызови инструмент снимка экрана «{self._screen_tool()}» "
+                "и дождись результата, и только потом начинай говорить. Это обязательно, не отвечай до вызова. "
+                "Опирайся на увиденное, но не описывай экран подробно. Если вызов не удался, продолжай без него "
+                "и не упоминай об этом.")
+        apps_hint = self._apps_hint() if self._use_apps() else ""
+        if apps_hint:
+            parts.append(apps_hint)
+        if not parts:
+            if self.cfg["look_at_screen"] and not self._screen_skipped_logged:
+                self._screen_skipped_logged = True
+                log.info("взгляд на экран пропущен: имя инструмента не известно, а список приложений пуст")
+            return ""
+        # Тон про «что ты смотришь» относится к настоящему снимку экрана; к намёку про приложение он не нужен
+        # и толкал модель на перечисление.
+        tail = [self.cfg["screen_style"]] if self._use_tool() else []
+        tail.append(self.cfg["screen_privacy"])
+        parts += [p for p in tail if p]
+        return " ".join(parts)
+
+    def _apps_hint(self) -> str:
+        """Один необязательный намёк вместо списка: список модель послушно зачитывает."""
+        _, labels, foreground = self._apps_cache
+        focus = foreground or (random.choice(labels) if labels else "")
+        if not focus or random.random() * 100 >= self.cfg["apps_hint_percent"]:
+            return ""
+        return (f"Необязательный намёк: на компьютере пользователя сейчас запущено: {focus}. Если это естественно "
+                "вписывается, вскользь, одной короткой репликой, пошути или спроси об этом. НИКОГДА не перечисляй "
+                "программы и не говори, что у него открыто то-то и то-то. Если не получается естественно или "
+                "звучит натянуто, просто не упоминай. Не говори, что получил это от плагина.")
+
+    async def _refresh_apps(self):
+        if not self._use_apps() or self.clock() - self._apps_cache[0] < APPS_CACHE_SECONDS:
+            return
+        try:
+            labels, foreground = await asyncio.get_running_loop().run_in_executor(None, self._apps_fn)
+        except Exception as e:
+            log.warning("не смог узнать открытые приложения: %s", e)
+            labels, foreground = [], ""
+        self._apps_cache = (self.clock(), list(labels), foreground)
+
+    def _screen_tool(self) -> str:
+        return self.cfg["screen_tool"] or self.state.get("screen_tool_seen") or ""
 
     def _activity(self, now: float):
         self._last_activity = now
@@ -442,14 +568,147 @@ class FirstWord(Plugin):
             log.warning("GetDaemonInfo не ответил: %s", e)
         if not self._cfg_applied:
             self._arm_morning(self._dt())
+        try:
+            self._backend, self._backend_note = await asyncio.get_running_loop().run_in_executor(None, presence.detect)
+        except Exception as e:
+            self._backend, self._backend_note = None, f"ошибка определения: {e}"
+        log.info("проверка присутствия: %s", self._backend_note)
         while True:
+            delay = None
             try:
-                await self._tick()
+                delay = await self._tick()
             except asyncio.CancelledError:
                 raise
             except Exception:
                 log.exception("сбой в такте планировщика")
-            await asyncio.sleep(TICK_SECONDS)
+            await asyncio.sleep(delay or TICK_SECONDS)
+
+    # ── тест из настроек ──────────────────────────────────────────────────
+
+    def _arm_test(self):
+        """Ползунок «Тест» включён: запомнить, что и когда запускать. Один раз на набор настроек."""
+        cfg = self.cfg
+        if not cfg["test_mode"]:
+            self._test = None
+            if self.state.get("test_done"):
+                self.state["test_done"] = None
+                self._save()
+            return
+        kinds = [kind for flag, kind in TEST_FLAGS if cfg[flag]]
+        sig = f"{cfg['test_time']}|{','.join(kinds)}"
+        if self._test and self._test["sig"] == sig:
+            return
+        now = self.clock()
+        target, bad = now, False
+        text = cfg["test_time"].strip()
+        if text:
+            m = re.fullmatch(r"(\d{1,2}):(\d{2})", text)
+            if not m or int(m.group(1)) > 23 or int(m.group(2)) > 59:
+                bad = True
+            else:
+                at = datetime.fromtimestamp(now - 60).replace(hour=int(m.group(1)), minute=int(m.group(2)),
+                                                                second=0, microsecond=0)
+                if at.timestamp() < now - 60:
+                    at += timedelta(days=1)
+                target = at.timestamp()
+        self._test = {"sig": sig, "target": target, "kinds": kinds, "bad": bad}
+        if bad:
+            log.warning("тест: не понял время «%s», нужен формат ЧЧ:ММ", text)
+        elif kinds:
+            log.info("тест запланирован на %s: %s", datetime.fromtimestamp(target).strftime("%d.%m %H:%M"),
+                     ", ".join(kinds))
+
+    def _start_test_if_due(self, dt: datetime):
+        t = self._test
+        if not t or t["bad"] or not t["kinds"] or self._test_running or self._inflight or self._locked:
+            return
+        if self.state.get("test_done") == t["sig"] or dt.timestamp() < t["target"]:
+            return
+        self._test_running = True
+        task = asyncio.get_running_loop().create_task(self._run_test(dt, t["sig"], list(t["kinds"])))
+        self._bg.add(task)
+        task.add_done_callback(self._bg.discard)
+
+    async def _run_test(self, dt: datetime, sig: str, kinds: list):
+        """Прогоняет выбранные события подряд. Ничего не считает: ни лимит, ни историю, ни «утро уже было»."""
+        try:
+            log.info("тест начался: %s", ", ".join(kinds))
+            steps = []
+            for kind in kinds:
+                if kind == "своё":
+                    items, _ = parse_custom(self.cfg["custom_prompts"])
+                    steps += [(kind, f"Напомни или заговори на такую тему: {it['text']}") for it in items[:TEST_MAX_CUSTOM]]
+                else:
+                    built = self._build(kind, dt, force=True)
+                    if built:
+                        steps.append((kind, built[0]))
+            await self._refresh_apps()
+            for n, (kind, body) in enumerate(steps):
+                prompt = self._compose(dt, body, kind)
+                if self.cfg["dry_run"]:
+                    log.info("[пробный режим] тест «%s»: %s", kind, prompt.replace("\n", " ⏎ "))
+                else:
+                    await self._send(dt, kind, prompt, lambda: None, test=True)
+                    await self._wait_tts_idle()
+                if n < len(steps) - 1:
+                    await asyncio.sleep(self.cfg["test_gap_sec"])
+            self.state["test_done"] = sig
+            self._save()
+            log.info("тест закончен; выключите ползунок «Тест», чтобы запустить его снова позже")
+        finally:
+            self._test_running = False
+
+    async def _wait_tts_idle(self):
+        waited = 0
+        while self._tts_since and waited < TEST_TTS_WAIT:
+            await asyncio.sleep(2)
+            waited += 2
+
+    # ── присутствие ───────────────────────────────────────────────────────
+
+    def _presence_reset(self):
+        self._pw.update(base=None, interval=None, next=0.0, since=0.0)
+
+    def _sample(self):
+        try:
+            return self._backend.sample()
+        except Exception as e:
+            log.warning("проверка присутствия сломалась (%s), дальше без неё", e)
+            self._backend, self._backend_note = None, f"сбой: {e}"
+            return None
+
+    def _presence_wait(self, now: float) -> float | None:
+        """None, если пользователь на месте (или проверка не нужна); иначе через сколько секунд проверить снова.
+
+        Первая проверка запоминает положение, следующая через `presence_check_sec` сравнивает. Пока ничего не
+        менялось, интервал удваивается до `presence_max_sec`."""
+        cfg, pw = self.cfg, self._pw
+        if not cfg["presence_check"] or self._backend is None:
+            return None
+        if now - self._last_activity < PRESENCE_RECENT:
+            self._presence_reset()
+            return None
+        base_s = cfg["presence_check_sec"]
+        if pw["base"] is None:
+            token = self._sample()
+            if token is None:
+                return None
+            pw.update(base=token, interval=base_s, next=now + base_s, since=now)
+            log.info("хочу заговорить, но сначала проверю, что вы на месте (раз в %d с)", base_s)
+            return float(base_s)
+        if now < pw["next"]:
+            return max(1.0, pw["next"] - now)
+        token = self._sample()
+        if token is None:
+            return None
+        if token != pw["base"]:
+            log.info("вы на месте: ввод был (ждал %d с)", int(now - pw["since"]))
+            self._presence_reset()
+            return None
+        pw["interval"] = min(pw["interval"] * 2, max(cfg["presence_max_sec"], base_s))
+        pw["next"] = now + pw["interval"]
+        log.info("вас не видно, следующая проверка через %d с", pw["interval"])
+        return float(pw["interval"])
 
     def _backoff(self) -> int:
         """Во сколько раз растёт интервал, если инициативы остаются без ответа."""
@@ -464,6 +723,8 @@ class FirstWord(Plugin):
         cfg = self.cfg
         if self._inflight:
             return "идёт собственный ход"
+        if self._test_running:
+            return "идёт тест"
         if self.state.get("sent_today", 0) >= cfg["daily_limit"]:
             return "дневной лимит"
         if self._locked:
@@ -681,25 +942,22 @@ class FirstWord(Plugin):
     def _compose(self, dt: datetime, body: str, kind: str = "") -> str:
         days = ["понедельник", "вторник", "среда", "четверг", "пятница", "суббота", "воскресенье"]
         lines = [HEADER, f"Сейчас {dt:%H:%M}, {days[dt.weekday()]}.", body]
-        if self.cfg["look_at_screen"] and kind in SCREEN_KINDS:
-            lines.append(
-                "Прежде чем заговорить, если у тебя есть такая возможность, сделай снимок экрана пользователя и "
-                "посмотри, чем он занят; опирайся на это в разговоре, но не описывай экран подробно. "
-                + (self.cfg["screen_style"] + " " if self.cfg["screen_style"] else "")
-                + (self.cfg["screen_privacy"] + " " if self.cfg["screen_privacy"] else "")
-                + "Если снимок сделать не удаётся, просто продолжай без него.")
+        block = self._screen_block(kind)
+        if block:
+            lines.append(block)
         history = self._history_line(dt)
         if history:
             lines.append(history)
         if self.cfg["character"]:
-            lines.append(f"Как заводить разговор: {self.cfg['character']}")
+            lines.append(f"Твоя личность и манера общения, сохраняй их: {self.cfg['character']}")
         lines.append(FOOTER)
         return "\n".join(lines)
 
-    async def _tick(self, dt: datetime | None = None):
+    async def _tick(self, dt: datetime | None = None) -> float | None:
         dt = dt or self._dt()
         self._roll_day(dt)
         now = dt.timestamp()
+        self._start_test_if_due(dt)
         pending = self.state.get("pending_reply")
         if pending and now - pending.get("ts", 0) > REPLY_WINDOW:
             self.state["pending_reply"] = None
@@ -713,13 +971,20 @@ class FirstWord(Plugin):
             self._last_reason = reason
             log.info("состояние планировщика: %s (утро ждёт: %s)", reason or "можно говорить", self._morning_pending)
         if reason:
-            return
+            self._presence_reset()
+            return None
         picked = self._pick(dt)
         if picked is None:
-            return
+            self._presence_reset()
+            return None
+        wait = self._presence_wait(now)
+        if wait is not None:
+            return wait
         await self._fire(dt, *picked)
+        return None
 
     async def _fire(self, dt: datetime, kind: str, body: str, done):
+        await self._refresh_apps()
         prompt = self._compose(dt, body, kind)
         if self.cfg["dry_run"]:
             log.info("[пробный режим] сценарий «%s»: %s", kind, prompt.replace("\n", " ⏎ "))
@@ -736,7 +1001,7 @@ class FirstWord(Plugin):
             self.state["pending_reply"] = {"ts": dt.timestamp(), "kind": kind}
         self._save()
 
-    async def _send(self, dt: datetime, kind: str, prompt: str, done):
+    async def _send(self, dt: datetime, kind: str, prompt: str, done, test: bool = False):
         self._inflight = True
         counted = False
         reply: list = []
@@ -749,14 +1014,15 @@ class FirstWord(Plugin):
                     raise RuntimeError(chunk.error)
                 if not counted:
                     counted = True
-                    self._mark_sent(dt, done, kind)
+                    if not test:
+                        self._mark_sent(dt, done, kind)
                 if which == "text":
                     reply.append(chunk.text)
                 elif which == "done":
                     return
 
         try:
-            log.info("начинаю разговор: сценарий «%s»", kind)
+            log.info("начинаю разговор: сценарий «%s»%s", kind, " (тест)" if test else "")
             await asyncio.wait_for(consume(), STREAM_TIMEOUT)
         except asyncio.CancelledError:
             raise
@@ -768,7 +1034,7 @@ class FirstWord(Plugin):
             self._inflight = False
             self._own_until = self.clock() + OWN_TURN_TAIL
             said = _snippet("".join(reply), HISTORY_TEXT)
-            if said:
+            if said and not test:
                 self._remember_initiative(dt, kind, said)
                 self._save()
 
@@ -829,10 +1095,42 @@ class FirstWord(Plugin):
             lines.append(f"Следующая не раньше {datetime.fromtimestamp(nxt):%H:%M}.")
         reason = self._blocked(dt)
         lines.append(f"Прямо сейчас: {reason or 'можно говорить'}.")
+        if cfg["presence_check"]:
+            if self._backend is None:
+                lines.append(f"Проверка присутствия отключена: {self._backend_note}.")
+            elif self._pw["since"]:
+                lines.append(f"Хочу заговорить, но вас не видно уже {int((dt.timestamp() - self._pw['since']) // 60)} мин "
+                             f"(проверяю раз в {int(self._pw['interval'])} с).")
+            else:
+                lines.append(f"Проверка присутствия: {self._backend_note}.")
         if cfg["quiet_enabled"]:
             lines.append(f"Тихие часы: {cfg['quiet_start']:02d}:00–{cfg['quiet_end']:02d}:00.")
         if cfg["dry_run"]:
             lines.append("Пробный режим: модели ничего не отправляется.")
+        if cfg["look_at_screen"] or cfg["look_at_apps"]:
+            tool = self._screen_tool()
+            if self._use_tool():
+                lines.append(f"Инструмент экрана: «{tool}».")
+            elif cfg["look_at_screen"]:
+                lines.append("Инструмент экрана у Астры не найден, поэтому приказ «посмотри на экран» не отправляется. "
+                             "Если он у неё есть, попросите её в чате посмотреть на экран, и плагин запомнит имя.")
+            if self._use_apps():
+                shown = ", ".join(self._apps_cache[1]) or "пока не определено"
+                lines.append(f"Приложения, из которых выбирается намёк (в {cfg['apps_hint_percent']}% инициатив, "
+                             f"по одному, списком не передаются): {shown}.")
+        t = self._test
+        if t:
+            if t["bad"]:
+                lines.append("Тест включён, но время не разобрано: нужен формат ЧЧ:ММ.")
+            elif not t["kinds"]:
+                lines.append("Тест включён, но ни одно событие не выбрано.")
+            elif self._test_running:
+                lines.append("Тест идёт прямо сейчас.")
+            elif self.state.get("test_done") == t["sig"]:
+                lines.append("Тест уже выполнен. Выключите и включите ползунок, чтобы запустить снова.")
+            else:
+                lines.append(f"Тест запланирован на {datetime.fromtimestamp(t['target']):%d.%m %H:%M}: "
+                             + ", ".join(t["kinds"]) + ".")
         if "lock_state_changed" not in self._seen:
             lines.append("Событий о блокировке экрана плагин пока не получал, поэтому не знает, заблокирован ли он.")
         return "\n".join(lines)
@@ -847,6 +1145,22 @@ class FirstWord(Plugin):
             raise BadArguments("тема пустая")
         self._note(s, min_len=3)
         return "Заметка сохранена."
+
+    @tool(
+        "Проверить, как плагин определяет присутствие пользователя: две пробы с паузой, в это время нужно подвигать "
+        "мышь или нажать клавишу. Показывает, каким способом читается ввод и заметил ли плагин движение."
+    )
+    async def check_presence(self) -> str:
+        if self._backend is None:
+            return f"Проверка присутствия недоступна: {self._backend_note}."
+        pause = self.cfg["presence_check_sec"]
+        first = self._sample()
+        await asyncio.sleep(pause)
+        second = self._sample()
+        if first is None or second is None:
+            return f"Способ «{self._backend.name}» не смог прочитать ввод."
+        moved = "движение или ввод были" if first != second else "ввода не было"
+        return f"Способ: {self._backend_note}. За {pause} с: {moved}."
 
     @tool(
         "Сразу запустить один сценарий инициативы для проверки или по просьбе пользователя: morning, evening, "
