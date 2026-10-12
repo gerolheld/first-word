@@ -1,8 +1,8 @@
 [plugin]
 id = "first-word"
-name = "Инициатива Астры"
-version = "0.1.0"
-description = "Астра сама начинает разговор: утреннее приветствие, напоминание про ночь, возврат к вчерашней теме."
+name = "First Move"
+version = "0.1.1"
+description = "Lets Astra start the conversation: a morning hello, a late-night nudge, check-ins after long silence and callbacks to yesterday."
 author = "gerolheld"
 license = "MIT"
 
@@ -31,21 +31,29 @@ schema = """
     "enable_morning": { "type": "boolean", "default": true, "title": "Утреннее приветствие", "description": "Первая активность за день после заданного часа или разблокировка экрана утром." },
     "morning_hour": { "type": "integer", "minimum": 0, "maximum": 23, "default": 8, "title": "Утро начинается с (час)" },
     "morning_until": { "type": "integer", "minimum": 1, "maximum": 24, "default": 12, "title": "Здороваться не позже (час)", "description": "Если первая активность позже, приветствия не будет." },
+    "weekend_shift_hours": { "type": "integer", "minimum": 0, "maximum": 6, "default": 1, "title": "Сдвиг утра в выходные (часов)", "description": "В субботу и воскресенье окно утра сдвигается на столько часов позже." },
     "enable_callback": { "type": "boolean", "default": true, "title": "Возврат к теме", "description": "Спросить, чем закончилось то, что обсуждали вчера. Идёт вместе с утренним приветствием." },
+    "enable_evening": { "type": "boolean", "default": false, "title": "Вечерний итог", "description": "Вечером, пока вы за компьютером, Астра спрашивает, как прошёл день. Раз в день." },
+    "evening_hour": { "type": "integer", "minimum": 0, "maximum": 23, "default": 21, "title": "Вечер начинается с (час)", "description": "Окно длится 3 часа." },
     "enable_night": { "type": "boolean", "default": true, "title": "Полуночник", "description": "Мягко предложить закругляться, если вы активны поздно ночью." },
     "night_hour": { "type": "integer", "minimum": 0, "maximum": 23, "default": 1, "title": "Ночь начинается с (час)", "description": "Окно длится 7 часов. Тихие часы сильнее него." },
     "enable_silence": { "type": "boolean", "default": true, "title": "Долгое молчание", "description": "Вы за компьютером (экран не заблокирован), но давно не общались с Астрой." },
     "silence_hours": { "type": "integer", "minimum": 1, "maximum": 48, "default": 3, "title": "Порог молчания (часов)" },
     "enable_random": { "type": "boolean", "default": true, "title": "Случайная мысль", "description": "Редко: Астра делится мыслью или вопросом." },
     "random_chance_percent": { "type": "integer", "minimum": 0, "maximum": 100, "default": 40, "title": "Шанс случайной мысли в день (%)" },
+    "custom_prompts": { "type": "string", "maxLength": 1500, "default": "", "title": "Свои поводы", "description": "По одному на строку: «09:30 напомни выпить воды» или «пн-пт 18:00 спроси про проект». Дни: пн-пт, сб,вс, будни, выходные. Каждый повод срабатывает раз в день в течение 3 часов после указанного времени." },
     "daily_limit": { "type": "integer", "minimum": 0, "maximum": 20, "default": 4, "title": "Инициатив в день, не больше", "description": "Каждая инициатива — один запрос к модели." },
     "min_interval_min": { "type": "integer", "minimum": 0, "maximum": 1440, "default": 90, "title": "Минимум между инициативами (минут)" },
+    "adaptive": { "type": "boolean", "default": true, "title": "Подстраивать частоту", "description": "Если Астре несколько раз подряд не ответили, интервал между инициативами растёт (до ×3), после ответа возвращается." },
     "quiet_enabled": { "type": "boolean", "default": true, "title": "Тихие часы" },
     "quiet_start": { "type": "integer", "minimum": 0, "maximum": 23, "default": 3, "title": "Тихие часы с (час)" },
     "quiet_end": { "type": "integer", "minimum": 0, "maximum": 23, "default": 8, "title": "Тихие часы до (час)" },
     "after_chat_pause_min": { "type": "integer", "minimum": 0, "maximum": 120, "default": 3, "title": "Пауза после разговора (минут)", "description": "Столько плагин молчит после последней реплики в чате." },
     "speak_aloud": { "type": "boolean", "default": true, "title": "Озвучивать" },
     "character": { "type": "string", "maxLength": 600, "default": "", "title": "Характер", "description": "Свободный текст о том, как Астра должна заводить разговор: тон, манера, о чём любит спрашивать." },
+    "look_at_screen": { "type": "boolean", "default": false, "title": "Смотреть на экран", "description": "Перед каждой инициативой, включая утреннее приветствие, Астра делает снимок экрана и опирается на него. Снимок видит модель, поэтому расходует баланс сильнее и затрагивает приватность." },
+    "screen_style": { "type": "string", "maxLength": 400, "default": "Поприветствуй как обычно, а потом по-доброму подколи и спроси про увиденное, например: «что ты опять смотришь?» или «опять этим занимаешься?». Без нравоучений и без злости.", "title": "Как реагировать на экран", "description": "Тон и манера, когда Астра смотрит на экран. Измените, если подколки не нравятся." },
+    "screen_privacy": { "type": "string", "maxLength": 400, "default": "Не упоминай и не пересказывай личное: переписки, почту, пароли, банки, сообщения других людей.", "title": "О чём молчать при взгляде на экран", "description": "Добавляется в подсказку, когда включено «Смотреть на экран»." },
     "dry_run": { "type": "boolean", "default": false, "title": "Пробный режим", "description": "Ничего не отправлять модели, только записывать в журнал, что было бы сказано." }
   }
 }

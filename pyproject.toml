@@ -1,7 +1,7 @@
 [project]
 name = "first_word"
-version = "0.1.0"
-description = "Астра сама начинает разговор: приветствие, ночь, молчание, возврат к теме."
+version = "0.1.1"
+description = "Lets Astra start the conversation: morning hello, late-night nudge, silence check-ins, callbacks."
 requires-python = ">=3.10"
 dependencies = [
     "astra-plugin-sdk>=0.5,<0.6",
