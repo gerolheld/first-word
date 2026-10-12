@@ -10,11 +10,12 @@ import json
 import logging
 import random
 import re
+import sys
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
 
-from astra_plugin_sdk import BadArguments, Plugin, tool
+from astra_plugin_sdk import BadArguments, Plugin, tool, ui_call, ui_overlay
 
 from . import apps, presence
 
@@ -44,6 +45,16 @@ DEFAULTS = {
     "evening_hour": 21,
     "enable_night": True,
     "night_hour": 1,
+    "enable_return": True,
+    "return_hours": 3,
+    "enable_break": True,
+    "break_minutes": 120,
+    "enable_lunch": False,
+    "lunch_hour": 13,
+    "enable_friday": False,
+    "friday_hour": 17,
+    "enable_game": False,
+    "game_minutes": 90,
     "enable_silence": True,
     "silence_hours": 3,
     "enable_random": True,
@@ -60,12 +71,14 @@ DEFAULTS = {
     "quiet_end": 8,
     "after_chat_pause_min": 3,
     "speak_aloud": True,
+    "show_widget": True,
+    "widget_place": "внизу справа",
+    "talk_level": "очень часто",
+    "enable_chat": False,
+    "chat_every_min": 60,
     "character": PERSONA,
-    "look_at_screen": True,
     "look_at_apps": True,
-    "apps_hint_percent": 50,
-    "screen_tool": "",
-    "screen_style": "Поприветствуй как обычно, а потом по-доброму подколи и спроси про увиденное, например: «что ты опять смотришь?» или «опять этим занимаешься?». Без нравоучений и без злости.",
+    "apps_hint_percent": 80,
     "screen_privacy": "Не упоминай и не пересказывай личное: переписки, почту, пароли, банки, сообщения других людей.",
     "dry_run": False,
     "test_mode": False,
@@ -73,6 +86,12 @@ DEFAULTS = {
     "test_morning": True,
     "test_evening": False,
     "test_night": False,
+    "test_chat": False,
+    "test_return": False,
+    "test_break": False,
+    "test_lunch": False,
+    "test_friday": False,
+    "test_game": False,
     "test_silence": False,
     "test_random": False,
     "test_custom": False,
@@ -85,6 +104,12 @@ RANGES = {
     "evening_hour": (0, 23),
     "night_hour": (0, 23),
     "silence_hours": (1, 48),
+    "return_hours": (1, 24),
+    "chat_every_min": (10, 480),
+    "break_minutes": (30, 480),
+    "lunch_hour": (0, 23),
+    "friday_hour": (0, 23),
+    "game_minutes": (20, 360),
     "random_chance_percent": (0, 100),
     "daily_limit": (0, 20),
     "min_interval_min": (0, 1440),
@@ -96,8 +121,12 @@ RANGES = {
     "presence_max_sec": (10, 1800),
     "test_gap_sec": (5, 300),
 }
-STR_LIMITS = {"character": 1200, "custom_prompts": 1500, "screen_privacy": 400, "screen_style": 400, "screen_tool": 80, "test_time": 5}
-SCREEN_KINDS = {"утро", "ночь", "молчание", "мысль", "вечер", "своё"}
+STR_LIMITS = {"character": 1200, "custom_prompts": 1500, "screen_privacy": 400, "talk_level": 30, "widget_place": 30, "test_time": 5}
+ENUMS = {
+    "talk_level": ["по моим настройкам", "часто", "очень часто"],
+    "widget_place": ["внизу справа", "внизу слева", "вверху справа", "вверху слева"],
+}
+SCREEN_KINDS = {"беседа", "утро", "ночь", "молчание", "мысль", "вечер", "своё", "возвращение", "обед", "пятница"}
 
 CORE_STATES = {0: "stopped", 1: "ready", 2: "listening", 3: "processing", 4: "speaking", 5: "error"}
 KNOWN_STATES = set(CORE_STATES.values())
@@ -108,6 +137,12 @@ KINDS = {
     "night": "ночь", "ночь": "ночь",
     "silence": "молчание", "молчание": "молчание",
     "random": "мысль", "мысль": "мысль",
+    "chat": "беседа", "беседа": "беседа",
+    "return": "возвращение", "возвращение": "возвращение",
+    "break": "перерыв", "перерыв": "перерыв",
+    "lunch": "обед", "обед": "обед",
+    "friday": "пятница", "пятница": "пятница",
+    "game": "игра", "игра": "игра",
 }
 DAY_NAMES = {
     "пн": 0, "вт": 1, "ср": 2, "чт": 3, "пт": 4, "сб": 5, "вс": 6,
@@ -116,12 +151,17 @@ DAY_NAMES = {
 
 TEST_FLAGS = [
     ("test_morning", "утро"), ("test_evening", "вечер"), ("test_night", "ночь"),
-    ("test_silence", "молчание"), ("test_random", "мысль"), ("test_custom", "своё"),
+    ("test_chat", "беседа"), ("test_return", "возвращение"), ("test_break", "перерыв"), ("test_lunch", "обед"), ("test_friday", "пятница"),
+    ("test_game", "игра"), ("test_silence", "молчание"), ("test_random", "мысль"), ("test_custom", "своё"),
 ]
+SESSION_GAP = 15 * 60          # пауза во вводе дольше этого заканчивает «сидение за компьютером»
+RETURN_WINDOW = 15 * 60        # сколько после возвращения ещё можно поздороваться
+LUNCH_SPAN_HOURS = 2
+FRIDAY_SPAN_HOURS = 3
+GAME_CHECK_SECONDS = 60
 TEST_TTS_WAIT = 90
 TEST_MAX_CUSTOM = 3
 
-SCREEN_TOOL_RE = re.compile(r"screen|скрин|capture|snapshot", re.I)
 APPS_CACHE_SECONDS = 30
 TICK_SECONDS = 20
 NIGHT_SPAN_HOURS = 7
@@ -149,7 +189,11 @@ HEADER = (
     "не отвечай на неё как на реплику пользователя и не упоминай её.]"
 )
 FOOTER = (
-    "Начни разговор сам: одна-две короткие живые фразы, без списков и без пересказа этой подсказки. "
+    "Как ответить: начни разговор сам, одна-две короткие живые фразы (около 25 слов), по-русски, сразу к делу. "
+    "Не представляйся, не говори «это сообщение от плагина», не упоминай подсказку, расписание, лимиты и время "
+    "запуска. Без списков, без отчётов, без длинных вступлений. Не повторяй формулировки своих прошлых "
+    "инициатив. Закончи одним лёгким вопросом, на который просто ответить, или ничем, если вопрос лишний. "
+    "Если пользователь явно занят, не дави. "
     "Если по ходу разговора всплывёт тема с продолжением (планы, ожидание результата, проблема), "
     "вызови инструмент remember_topic с короткой заметкой."
 )
@@ -258,6 +302,7 @@ def parse_custom(text: str) -> tuple[list, int]:
     return items, bad
 
 
+@ui_overlay("first-word-countdown", "countdown.html", url_width=260, url_height=72)
 class FirstWord(Plugin):
     """Даёт Астре инициативу: она сама начинает разговор."""
 
@@ -286,12 +331,15 @@ class FirstWord(Plugin):
         self._cfg_applied = False
         self._apps_fn = apps.snapshot
         self._apps_cache = (0.0, [], "")
-        self._screen_skipped_logged = False
         self._test = None
         self._test_running = False
         self._backend = None
         self._backend_note = "ещё не определён"
         self._pw = {"base": None, "interval": None, "next": 0.0, "since": 0.0}
+        self._inp = {"token": None, "last": 0.0, "session": 0.0}
+        self._return_at = 0.0
+        self._game_since = 0.0
+        self._game_checked = 0.0
 
     def _dt(self) -> datetime:
         return datetime.fromtimestamp(self.clock())
@@ -308,7 +356,6 @@ class FirstWord(Plugin):
             "tts_started",
             "tts_completed",
             "tts_interrupted",
-            "tool_started",
         ]
 
     async def on_config_changed(self, config: dict):
@@ -321,14 +368,38 @@ class FirstWord(Plugin):
             elif isinstance(default, int):
                 lo, hi = RANGES[key]
                 cfg[key] = _num(v, lo, hi, default)
+            elif key in ENUMS:
+                cfg[key] = v if v in ENUMS[key] else default
             else:
                 cfg[key] = v.strip()[:STR_LIMITS[key]] if isinstance(v, str) else default
-        self.cfg = cfg
+        self.cfg = self._apply_level(cfg)
         self._ensure_started()
         self._arm_test()
         if not self._cfg_applied:
             self._cfg_applied = True
             self._arm_morning(self._dt())  # запуск Astra утром считается первой активностью
+
+    @staticmethod
+    def _apply_level(cfg: dict) -> dict:
+        """«Как часто говорить»: готовые наборы поверх ваших настроек (ваши значения только подтягиваются в нужную сторону)."""
+        level = cfg.get("talk_level")
+        if level not in ("часто", "очень часто"):
+            return cfg
+        often = level == "часто"
+        out = dict(cfg)
+        out.update(
+            enable_chat=True,
+            enable_random=True,
+            random_chance_percent=100,
+            daily_limit=max(cfg["daily_limit"], 12 if often else 30),
+            min_interval_min=min(cfg["min_interval_min"], 40 if often else 15),
+            chat_every_min=min(cfg["chat_every_min"], 60 if often else 25),
+            after_chat_pause_min=min(cfg["after_chat_pause_min"], 2 if often else 1),
+            silence_hours=1,
+        )
+        if not often:
+            out["adaptive"] = False
+        return out
 
     def _ensure_started(self):
         if self._task is not None:
@@ -399,7 +470,7 @@ class FirstWord(Plugin):
         now = self.clock()
         if event_type not in self._seen:
             self._seen.add(event_type)
-            shown = sorted(payload) if event_type == "tool_started" else json.dumps(payload, ensure_ascii=False)[:300]
+            shown = json.dumps(payload, ensure_ascii=False)[:300]
             log.info("первое событие %s: %s", event_type, shown)
         if event_type == "state_changed":
             p = _inner(payload, "state_changed")
@@ -429,8 +500,6 @@ class FirstWord(Plugin):
                 self._interaction(now)
                 if role == "user":
                     self._note(payload.get("text", payload.get("content")))
-        elif event_type == "tool_started":
-            self._learn_screen_tool(payload)
         elif event_type in ("tts_started", "tts_completed", "tts_interrupted"):
             # Астра не всегда присылает chat_message/state_changed, а озвучка приходит. Её собственная
             # речь (не наша инициатива) означает, что идёт разговор, то есть пользователь на месте.
@@ -439,51 +508,17 @@ class FirstWord(Plugin):
             if not self._own(now):
                 self._interaction(now)
 
-    def _learn_screen_tool(self, payload: dict):
-        """Запоминает имя инструмента, которым Астра смотрит на экран, чтобы звать его по имени."""
-        inner = payload.get("tool")
-        candidates = [payload.get("name"), payload.get("tool_name"),
-                      inner if isinstance(inner, str) else (inner or {}).get("name") if isinstance(inner, dict) else None]
-        for name in candidates:
-            if isinstance(name, str) and SCREEN_TOOL_RE.search(name) and len(name) <= 80:
-                if self.state.get("screen_tool_seen") != name:
-                    self.state["screen_tool_seen"] = name
-                    self._save()
-                    log.info("запомнил инструмент экрана: %s", name)
-                return
-
-    def _use_tool(self) -> bool:
-        """Приказ «посмотри на экран» отдаём только когда известно имя инструмента: иначе Астра зря ищет его."""
-        return bool(self.cfg["look_at_screen"] and self._screen_tool())
-
     def _use_apps(self) -> bool:
-        cfg = self.cfg
-        return bool(cfg["look_at_apps"] or (cfg["look_at_screen"] and not self._screen_tool()))
+        return bool(self.cfg["look_at_apps"])
 
     def _screen_block(self, kind: str) -> str:
-        if kind not in SCREEN_KINDS:
+        """Подсказка про активные приложения (и просьба не лезть в личное) для сценариев, где это уместно."""
+        if kind not in SCREEN_KINDS or not self._use_apps():
             return ""
-        parts = []
-        if self._use_tool():
-            parts.append(
-                f"СНАЧАЛА посмотри на экран пользователя: вызови инструмент снимка экрана «{self._screen_tool()}» "
-                "и дождись результата, и только потом начинай говорить. Это обязательно, не отвечай до вызова. "
-                "Опирайся на увиденное, но не описывай экран подробно. Если вызов не удался, продолжай без него "
-                "и не упоминай об этом.")
-        apps_hint = self._apps_hint() if self._use_apps() else ""
-        if apps_hint:
-            parts.append(apps_hint)
-        if not parts:
-            if self.cfg["look_at_screen"] and not self._screen_skipped_logged:
-                self._screen_skipped_logged = True
-                log.info("взгляд на экран пропущен: имя инструмента не известно, а список приложений пуст")
+        hint = self._apps_hint()
+        if not hint:
             return ""
-        # Тон про «что ты смотришь» относится к настоящему снимку экрана; к намёку про приложение он не нужен
-        # и толкал модель на перечисление.
-        tail = [self.cfg["screen_style"]] if self._use_tool() else []
-        tail.append(self.cfg["screen_privacy"])
-        parts += [p for p in tail if p]
-        return " ".join(parts)
+        return " ".join(x for x in (hint, self.cfg["screen_privacy"]) if x)
 
     def _apps_hint(self) -> str:
         """Один необязательный намёк вместо списка: список модель послушно зачитывает."""
@@ -491,13 +526,13 @@ class FirstWord(Plugin):
         focus = foreground or (random.choice(labels) if labels else "")
         if not focus or random.random() * 100 >= self.cfg["apps_hint_percent"]:
             return ""
-        return (f"Необязательный намёк: на компьютере пользователя сейчас запущено: {focus}. Если это естественно "
-                "вписывается, вскользь, одной короткой репликой, пошути или спроси об этом. НИКОГДА не перечисляй "
-                "программы и не говори, что у него открыто то-то и то-то. Если не получается естественно или "
-                "звучит натянуто, просто не упоминай. Не говори, что получил это от плагина.")
+        return (f"Опорная деталь: на компьютере пользователя сейчас запущено: {focus}. Обыграй именно это в своей "
+                "реплике: спроси, чем он там занят, пошути или прокомментируй, это должно быть ядром фразы. "
+                "НИКОГДА не перечисляй программы и не говори, что у него открыто то-то и то-то, назови только эту "
+                "одну. Не говори, что получил это от плагина или что следишь.")
 
-    async def _refresh_apps(self):
-        if not self._use_apps() or self.clock() - self._apps_cache[0] < APPS_CACHE_SECONDS:
+    async def _refresh_apps(self, force: bool = False):
+        if not (force or self._use_apps()) or self.clock() - self._apps_cache[0] < APPS_CACHE_SECONDS:
             return
         try:
             labels, foreground = await asyncio.get_running_loop().run_in_executor(None, self._apps_fn)
@@ -505,9 +540,6 @@ class FirstWord(Plugin):
             log.warning("не смог узнать открытые приложения: %s", e)
             labels, foreground = [], ""
         self._apps_cache = (self.clock(), list(labels), foreground)
-
-    def _screen_tool(self) -> str:
-        return self.cfg["screen_tool"] or self.state.get("screen_tool_seen") or ""
 
     def _activity(self, now: float):
         self._last_activity = now
@@ -666,6 +698,44 @@ class FirstWord(Plugin):
 
     # ── присутствие ───────────────────────────────────────────────────────
 
+    def _track_input(self, now: float, dt: datetime):
+        """Следит за вводом (мышь и клавиатура): когда человек сел, ушёл и вернулся. Коды клавиш не читаются."""
+        if not self.cfg["presence_check"] or self._backend is None:
+            return
+        token = self._sample()
+        inp = self._inp
+        if token is None:
+            return
+        if inp["token"] is None:
+            inp["token"] = token
+            return
+        if token == inp["token"]:
+            return
+        inp["token"] = token
+        last = inp["last"]
+        if not last:
+            inp["session"] = now
+        elif now - last >= SESSION_GAP:
+            inp["session"] = now
+            if now - last >= self.cfg["return_hours"] * 3600:
+                self._return_at = now
+                log.info("вы вернулись после %d мин отсутствия", int((now - last) / 60))
+        inp["last"] = now
+        self._arm_morning(dt)
+
+    async def _track_game(self, now: float):
+        if not self.cfg["enable_game"]:
+            self._game_since = 0.0
+            return
+        if now - self._game_checked < GAME_CHECK_SECONDS:
+            return
+        self._game_checked = now
+        await self._refresh_apps(force=True)
+        if "игра" in self._apps_cache[1]:
+            self._game_since = self._game_since or now
+        else:
+            self._game_since = 0.0
+
     def _presence_reset(self):
         self._pw.update(base=None, interval=None, next=0.0, since=0.0)
 
@@ -685,7 +755,7 @@ class FirstWord(Plugin):
         cfg, pw = self.cfg, self._pw
         if not cfg["presence_check"] or self._backend is None:
             return None
-        if now - self._last_activity < PRESENCE_RECENT:
+        if now - max(self._last_activity, self._inp["last"]) < PRESENCE_RECENT:
             self._presence_reset()
             return None
         base_s = cfg["presence_check_sec"]
@@ -807,6 +877,7 @@ class FirstWord(Plugin):
 
             def done():
                 self._morning_pending = False
+                self._return_at = 0.0
                 self.state["morning_done"] = today
                 for n in topics:
                     n["asked"] = True
@@ -828,6 +899,54 @@ class FirstWord(Plugin):
                 self.state["night_done"] = key
             return ("Уже поздняя ночь, а пользователь всё ещё за компьютером. "
                     "Мягко, без нравоучений предложи закругляться и лечь спать."), done
+
+        if kind == "беседа":
+            topics = self._old_topics(dt, 1)
+
+            def done():
+                for n in topics:
+                    n["used"] = now
+            return ("Давно не болтали. Заведи лёгкий непринуждённый разговор: пошути, поделись наблюдением, "
+                    "спроси, чем человек занят или как настроение; можно про музыку, игры, погоду или что-то "
+                    "интересное, что тебе пришло в голову. Не о делах и не отчётом, как подруга между делом."
+                    + (self._topics_line(topics) if topics else "")), done
+
+        if kind == "возвращение":
+            def done():
+                self._return_at = 0.0
+            return (f"Пользователь только что вернулся к компьютеру после долгого отсутствия (больше "
+                    f"{cfg['return_hours']} ч). Тепло поприветствуй, как будто соскучилась, и спроси, как он, "
+                    "без допроса, где пропадал."), done
+
+        if kind == "перерыв":
+            since = max(self._inp["session"], self.state.get("break_last", 0))
+            mins = max(cfg["break_minutes"], int((now - since) / 60)) if since else cfg["break_minutes"]
+
+            def done():
+                self.state["break_last"] = now
+            return (f"Пользователь уже около {mins // 60} ч {mins % 60:02d} мин сидит за компьютером без перерыва. "
+                    "Заботливо, без нравоучений предложи размяться, выпить воды или дать глазам отдохнуть."), done
+
+        if kind == "обед":
+            def done():
+                self.state["lunch_done"] = today
+            return ("Сейчас время обеда. Спроси, ел ли пользователь, и по-доброму предложи сделать перерыв на еду, "
+                    "если ещё нет."), done
+
+        if kind == "пятница":
+            def done():
+                self.state["friday_done"] = today
+            return ("Сегодня пятница, рабочая неделя заканчивается. Спроси, как прошла неделя и какие планы на "
+                    "выходные, без допроса."), done
+
+        if kind == "игра":
+            mins = int((now - self._game_since) / 60) if self._game_since else cfg["game_minutes"]
+
+            def done():
+                self.state["game_done"] = today
+            return (f"Пользователь уже около {max(mins, cfg['game_minutes'])} минут играет в игру. Не мешай и не читай "
+                    "нотаций: коротко и с интересом спроси, во что он играет и как идёт, или шутливо предложи "
+                    "размяться, если сидит давно."), done
 
         if kind == "молчание":
             topics = self._old_topics(dt, 1)
@@ -886,10 +1005,38 @@ class FirstWord(Plugin):
                 self.state.setdefault("custom_done", {})[key] = today
             return ("своё", f"Напомни или заговори на такую тему: {item['text']}", done)
 
+        if cfg["enable_return"] and self._return_at:
+            if now - self._return_at >= RETURN_WINDOW:
+                self._return_at = 0.0
+            else:
+                return ("возвращение", *self._build("возвращение", dt))
+
+        if cfg["enable_game"] and self._game_since and now - self._game_since >= cfg["game_minutes"] * 60 \
+                and self.state.get("game_done") != today:
+            return ("игра", *self._build("игра", dt))
+
+        inp = self._inp
+        if cfg["enable_break"] and inp["session"] and now - inp["last"] < PRESENCE_RECENT \
+                and now - max(inp["session"], self.state.get("break_last", 0)) >= cfg["break_minutes"] * 60:
+            return ("перерыв", *self._build("перерыв", dt))
+
+        present = now - max(self._last_activity, inp["last"], self.state.get("last_interaction", 0)) < PRESENCE_WINDOW
+        if cfg["enable_lunch"] and cfg["lunch_hour"] <= hour < min(24, cfg["lunch_hour"] + LUNCH_SPAN_HOURS) \
+                and self.state.get("lunch_done") != today and present:
+            return ("обед", *self._build("обед", dt))
+
+        if cfg["enable_friday"] and dt.weekday() == 4 \
+                and cfg["friday_hour"] <= hour < min(24, cfg["friday_hour"] + FRIDAY_SPAN_HOURS) \
+                and self.state.get("friday_done") != today and present:
+            return ("пятница", *self._build("пятница", dt))
+
         if cfg["enable_evening"] and cfg["evening_hour"] <= hour < min(24, cfg["evening_hour"] + EVENING_SPAN_HOURS):
-            present = now - max(self._last_activity, self.state.get("last_interaction", 0)) < PRESENCE_WINDOW
             if self.state.get("evening_done") != today and present:
                 return ("вечер", *self._build("вечер", dt))
+
+        if cfg["enable_chat"] and present \
+                and now - max(self.state.get("last_interaction", 0), self.state.get("last_sent", 0)) >= cfg["chat_every_min"] * 60:
+            return ("беседа", *self._build("беседа", dt))
 
         if cfg["enable_silence"]:
             ref = max(self.state.get("last_interaction", 0), self._unlock_or_start, self.state.get("last_sent", 0))
@@ -941,7 +1088,8 @@ class FirstWord(Plugin):
 
     def _compose(self, dt: datetime, body: str, kind: str = "") -> str:
         days = ["понедельник", "вторник", "среда", "четверг", "пятница", "суббота", "воскресенье"]
-        lines = [HEADER, f"Сейчас {dt:%H:%M}, {days[dt.weekday()]}.", body]
+        part = "ночь" if dt.hour < 5 else "утро" if dt.hour < 12 else "день" if dt.hour < 18 else "вечер"
+        lines = [HEADER, f"Сейчас {dt:%H:%M}, {days[dt.weekday()]}, {part}. Подстрой приветствие под это время.", body]
         block = self._screen_block(kind)
         if block:
             lines.append(block)
@@ -957,6 +1105,8 @@ class FirstWord(Plugin):
         dt = dt or self._dt()
         self._roll_day(dt)
         now = dt.timestamp()
+        self._track_input(now, dt)
+        await self._track_game(now)
         self._start_test_if_due(dt)
         pending = self.state.get("pending_reply")
         if pending and now - pending.get("ts", 0) > REPLY_WINDOW:
@@ -1057,6 +1207,213 @@ class FirstWord(Plugin):
         self._save()
         return "Пауза снята, инициатива включена."
 
+    # ── счётчик до следующего события ─────────────────────────────────────
+
+    def _forecast(self, dt: datetime) -> list:
+        """[(время или None, сценарий, пояснение)]: когда каждый включённый сценарий может сработать в следующий раз.
+
+        None — срок задаётся не часами, а условием («при первой активности», «когда вернётесь»)."""
+        cfg, st = self.cfg, self.state
+        now, today, hour = dt.timestamp(), dt.date().isoformat(), dt.hour
+
+        def at(offset: int, h: int, m: int = 0) -> float:
+            return (dt + timedelta(days=offset)).replace(hour=h, minute=m, second=0, microsecond=0).timestamp()
+
+        def window(kind, start_h, span, done_key, extra_days=None):
+            """Окно [start_h, start_h+span) раз в день: когда откроется в следующий раз."""
+            end_h = min(24, start_h + span)
+            for off in range(8):
+                day = (dt + timedelta(days=off))
+                if extra_days is not None and day.weekday() not in extra_days:
+                    continue
+                if off == 0 and (hour >= end_h or st.get(done_key) == today):
+                    continue
+                if off == 0 and hour >= start_h:
+                    return (None, kind, "сейчас, если вы за компьютером")
+                return (at(off, start_h), kind, "")
+            return None
+
+        out = []
+        if cfg["enable_morning"] or cfg["enable_callback"]:
+            if st.get("morning_done") != today:
+                start, end = self._morning_window(dt)
+                if hour < start:
+                    out.append((at(0, start), "утро", "при первой активности после этого часа"))
+                elif hour < end:
+                    out.append((None, "утро", "при первой вашей активности (окно до %d:00)" % end))
+            if not out or out[-1][1] != "утро":
+                tomorrow = dt + timedelta(days=1)
+                out.append((at(1, self._morning_window(tomorrow)[0]), "утро", "при первой активности"))
+        if cfg["enable_evening"]:
+            out.append(window("вечер", cfg["evening_hour"], EVENING_SPAN_HOURS, "evening_done"))
+        if cfg["enable_lunch"]:
+            out.append(window("обед", cfg["lunch_hour"], LUNCH_SPAN_HOURS, "lunch_done"))
+        if cfg["enable_friday"]:
+            out.append(window("пятница", cfg["friday_hour"], FRIDAY_SPAN_HOURS, "friday_done", {4}))
+        if cfg["enable_night"]:
+            start = at(0, cfg["night_hour"])
+            night_key = (dt.replace(hour=cfg["night_hour"], minute=0, second=0, microsecond=0)
+                         - (timedelta(days=1) if start > now else timedelta())).date().isoformat()
+            if start <= now:
+                if (hour - cfg["night_hour"]) % 24 < NIGHT_SPAN_HOURS and st.get("night_done") != night_key:
+                    out.append((None, "ночь", "сейчас, если вы активны"))
+                else:
+                    out.append((at(1, cfg["night_hour"]), "ночь", "если вы будете активны"))
+            else:
+                out.append((start, "ночь", "если вы будете активны"))
+        if cfg["enable_chat"]:
+            out.append((max(st.get("last_interaction", 0), st.get("last_sent", 0)) + cfg["chat_every_min"] * 60, "беседа",
+                        "если вы будете за компьютером"))
+        if cfg["enable_silence"]:
+            ref = max(st.get("last_interaction", 0), self._unlock_or_start, st.get("last_sent", 0))
+            out.append((ref + cfg["silence_hours"] * 3600, "молчание", "если не будет разговора с Астрой"))
+        if cfg["enable_random"]:
+            plan = st.get("random") if isinstance(st.get("random"), dict) else {}
+            if plan.get("day") == today and plan.get("ts") and not plan.get("done"):
+                out.append((plan["ts"], "мысль", ""))
+            else:
+                out.append((at(1, 9), "мысль", "не раньше; выпадет с шансом %d%%" % cfg["random_chance_percent"]))
+        items, _ = parse_custom(cfg["custom_prompts"])
+        best = None
+        for it in items:
+            done_today = st.get("custom_done", {}).get(it["key"]) == today
+            for off in range(8):
+                if (dt + timedelta(days=off)).weekday() not in it["days"]:
+                    continue
+                ts = at(off, it["minute"] // 60, it["minute"] % 60)
+                if off == 0 and (done_today or now - ts >= CUSTOM_WINDOW_MIN * 60):
+                    continue
+                cand = (max(ts, now) if ts < now else ts, "своё", it["text"][:40])
+                if best is None or cand[0] < best[0]:
+                    best = cand
+                break
+        if best:
+            out.append(best)
+        if cfg["enable_return"]:
+            out.append((None, "возвращение", "когда вернётесь после %d ч отсутствия" % cfg["return_hours"]))
+        if cfg["enable_break"]:
+            sess = self._inp["session"]
+            if sess and now - self._inp["last"] < SESSION_GAP:
+                out.append((max(sess, st.get("break_last", 0)) + cfg["break_minutes"] * 60, "перерыв",
+                            "если будете сидеть без пауз"))
+            else:
+                out.append((None, "перерыв", "после %d мин без пауз за компьютером" % cfg["break_minutes"]))
+        if cfg["enable_game"]:
+            if self._game_since and st.get("game_done") != today:
+                out.append((self._game_since + cfg["game_minutes"] * 60, "игра", "если игра останется открытой"))
+            else:
+                out.append((None, "игра", "когда игра будет идти %d мин" % cfg["game_minutes"]))
+        return [e for e in out if e]
+
+    def _earliest_allowed(self, dt: datetime) -> tuple:
+        """(самый ранний момент, когда ограничения позволят заговорить, почему он такой) или (now, "")."""
+        cfg, st = self.cfg, self.state
+        now = dt.timestamp()
+        t, why = now, ""
+        for ts, label in ((st.get("last_sent", 0) + cfg["min_interval_min"] * 60 * self._backoff(), "пауза между сообщениями"),
+                          (st.get("pause_until", 0), "пауза по просьбе"), (self._retry_after, "пауза после неудачи")):
+            if ts > t:
+                t, why = ts, label
+        if st.get("sent_today", 0) >= cfg["daily_limit"]:
+            t, why = (dt + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0).timestamp(), "дневной лимит"
+        return t, why
+
+    def _shift_quiet(self, ts: float) -> float:
+        cfg = self.cfg
+        if not cfg["quiet_enabled"]:
+            return ts
+        d = datetime.fromtimestamp(ts)
+        if _in_hours(d.hour, cfg["quiet_start"], cfg["quiet_end"]):
+            end = d.replace(hour=cfg["quiet_end"], minute=0, second=0, microsecond=0)
+            if end.timestamp() <= ts:
+                end += timedelta(days=1)
+            return end.timestamp()
+        return ts
+
+    @staticmethod
+    def _span(sec: float) -> str:
+        m = max(0, int(sec // 60))
+        if m < 1:
+            return "меньше минуты"
+        h, m = divmod(m, 60)
+        d, h = divmod(h, 24)
+        return " ".join(x for x in (f"{d} д" if d else "", f"{h} ч" if h else "", f"{m} мин" if m and not d else "") if x)
+
+    def _plan(self, dt: datetime) -> tuple:
+        """([(время, сценарий, пояснение, сдвинуто)] по возрастанию, [(сценарий, условие)], причина сдвига)."""
+        self._roll_day(dt)
+        allowed, why = self._earliest_allowed(dt)
+        timed, cond = [], []
+        for ts, kind, note in self._forecast(dt):
+            if ts is None:
+                cond.append((kind, note))
+                continue
+            eff = self._shift_quiet(max(ts, allowed))
+            timed.append((eff, kind, note, eff > ts + 60))
+        timed.sort()
+        return timed, cond, why
+
+    def next_event_text(self, dt: datetime | None = None) -> str:
+        dt = dt or self._dt()
+        now = dt.timestamp()
+        timed, cond, why = self._plan(dt)
+
+        def when(ts):
+            d = datetime.fromtimestamp(ts)
+            day = "" if d.date() == dt.date() else " завтра" if d.date() == (dt + timedelta(days=1)).date() else f" {d:%d.%m}"
+            return f"через {self._span(ts - now)} (в {d:%H:%M}{day})"
+
+        if not timed and not cond:
+            return "Ни один сценарий не включён, ждать нечего."
+        lines = []
+        if timed:
+            ts, kind, note, delayed = timed[0]
+            lines.append(f"Следующее: «{kind}» {when(ts)}" + (f", {note}" if note else "") + ".")
+            if delayed and why:
+                lines.append(f"Раньше не выйдет: {why}.")
+            elif delayed:
+                lines.append("Сдвинуто тихими часами.")
+            rest = timed[1:5]
+            if rest:
+                lines.append("Потом: " + "; ".join(f"«{k}» {when(t)}" for t, k, _, _ in rest) + ".")
+        else:
+            lines.append("По часам ничего не назначено.")
+        if cond:
+            lines.append("Без точного времени: " + "; ".join(f"«{k}», {n}" for k, n in cond) + ".")
+        if self.state.get("pause_until", 0) > now:
+            lines.append(f"Сейчас пауза до {datetime.fromtimestamp(self.state['pause_until']):%H:%M %d.%m}.")
+        return "\n".join(lines)
+
+    def countdown_data(self, dt: datetime | None = None) -> dict:
+        """Данные для плашки: что показать и сколько секунд осталось."""
+        dt = dt or self._dt()
+        now = dt.timestamp()
+        if not self.cfg["show_widget"]:
+            return {"visible": False}
+        timed, cond, why = self._plan(dt)
+        paused = self.state.get("pause_until", 0) > now
+        out = {"visible": True, "now": now, "place": self.cfg["widget_place"], "paused": paused,
+               "pause_until": f"{datetime.fromtimestamp(self.state['pause_until']):%H:%M}" if paused else "",
+               "more": [{"kind": k, "at": f"{datetime.fromtimestamp(t):%H:%M}", "in": int(t - now)}
+                        for t, k, _, _ in timed[1:4]],
+               "cond": [{"kind": k, "note": n} for k, n in cond[:4]],
+               "left_today": max(0, self.cfg["daily_limit"] - self.state.get("sent_today", 0))}
+        if timed:
+            ts, kind, note, delayed = timed[0]
+            d = datetime.fromtimestamp(ts)
+            out.update(kind=kind, ts=ts, left=int(ts - now), note=note, delayed=delayed, why=why,
+                       at=f"{d:%H:%M}" + ("" if d.date() == dt.date() else f" {d:%d.%m}"))
+        return out
+
+    @ui_call
+    async def get_countdown(self, **params):
+        return self.countdown_data()
+
+    @tool("Сколько осталось до следующего события: какой сценарий сработает ближайшим и через сколько, что за ним "
+          "и что ждёт условия. Учитывает лимит, паузу между сообщениями, тихие часы и паузу по просьбе.")
+    async def next_event(self) -> str:
+        return self.next_event_text()
+
     @tool("Показать состояние инициативы: что включено, что уже было сегодня, сколько осталось и почему сейчас тихо.")
     async def initiative_status(self) -> str:
         dt = self._dt()
@@ -1067,6 +1424,12 @@ class FirstWord(Plugin):
             ("возврат к теме", cfg["enable_callback"]),
             ("вечерний итог", cfg["enable_evening"]),
             ("полуночник", cfg["enable_night"]),
+            ("возвращение после отсутствия", cfg["enable_return"]),
+            ("перерыв при долгом сидении", cfg["enable_break"]),
+            ("обед", cfg["enable_lunch"]),
+            ("пятница", cfg["enable_friday"]),
+            ("игра", cfg["enable_game"]),
+            ("лёгкая беседа", cfg["enable_chat"]),
             ("долгое молчание", cfg["enable_silence"]),
             ("случайная мысль", cfg["enable_random"]),
         ]
@@ -1107,17 +1470,10 @@ class FirstWord(Plugin):
             lines.append(f"Тихие часы: {cfg['quiet_start']:02d}:00–{cfg['quiet_end']:02d}:00.")
         if cfg["dry_run"]:
             lines.append("Пробный режим: модели ничего не отправляется.")
-        if cfg["look_at_screen"] or cfg["look_at_apps"]:
-            tool = self._screen_tool()
-            if self._use_tool():
-                lines.append(f"Инструмент экрана: «{tool}».")
-            elif cfg["look_at_screen"]:
-                lines.append("Инструмент экрана у Астры не найден, поэтому приказ «посмотри на экран» не отправляется. "
-                             "Если он у неё есть, попросите её в чате посмотреть на экран, и плагин запомнит имя.")
-            if self._use_apps():
-                shown = ", ".join(self._apps_cache[1]) or "пока не определено"
-                lines.append(f"Приложения, из которых выбирается намёк (в {cfg['apps_hint_percent']}% инициатив, "
-                             f"по одному, списком не передаются): {shown}.")
+        if cfg["look_at_apps"]:
+            shown = ", ".join(self._apps_cache[1]) or "пока не определено"
+            lines.append(f"Приложения, из которых выбирается опорная деталь (в {cfg['apps_hint_percent']}% инициатив, "
+                         f"по одному, списком не передаются): {shown}.")
         t = self._test
         if t:
             if t["bad"]:
@@ -1133,6 +1489,7 @@ class FirstWord(Plugin):
                              + ", ".join(t["kinds"]) + ".")
         if "lock_state_changed" not in self._seen:
             lines.append("Событий о блокировке экрана плагин пока не получал, поэтому не знает, заблокирован ли он.")
+        lines.append(self.next_event_text(dt).split("\n")[0])
         return "\n".join(lines)
 
     @tool(
@@ -1164,12 +1521,12 @@ class FirstWord(Plugin):
 
     @tool(
         "Сразу запустить один сценарий инициативы для проверки или по просьбе пользователя: morning, evening, "
-        "night, silence или random. Учитывает дневной лимит и блокировку экрана, остальные ограничения снимает."
+        "night, silence, random, chat, return, break, lunch, friday или game. Учитывает дневной лимит и блокировку экрана, остальные ограничения снимает."
     )
     async def trigger_now(self, scenario: str) -> str:
         kind = KINDS.get(str(scenario).strip().lower())
         if kind is None:
-            raise BadArguments("сценарий: morning, evening, night, silence или random")
+            raise BadArguments("сценарий: morning, evening, night, silence, random, chat, return, break, lunch, friday или game")
         dt = self._dt()
         self._roll_day(dt)
         reason = self._blocked(dt, force=True)

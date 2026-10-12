@@ -1,6 +1,6 @@
 [project]
 name = "first_word"
-version = "0.1.2"
+version = "0.2.0"
 description = "Lets Astra speak first, in her own voice: morning hello, late-night nudge, silence check-ins, callbacks, reminders."
 requires-python = ">=3.10"
 dependencies = [

@@ -1,7 +1,7 @@
 [plugin]
 id = "first-word"
 name = "First Move"
-version = "0.1.2"
+version = "0.2.0"
 description = "Lets Astra speak first, in her own voice and personality: a morning hello, a late-night nudge, check-ins after long silence, callbacks to yesterday and your own reminders. Careful with your balance, with a built-in test."
 author = "gerolheld"
 license = "MIT"
@@ -14,9 +14,10 @@ runtimes = ["python"]
 [capabilities]
 tools = true
 event_handlers = true
+ui_contributions = true
 
 [permissions]
-subscribe_events = { types = ["state_changed", "lock_state_changed", "speech_recognized", "chat_message", "tts_started", "tts_completed", "tts_interrupted", "tool_started"], reason = "Молчит, пока идёт разговор, Астра говорит или экран заблокирован; запоминает имя её инструмента экрана." }
+subscribe_events = { types = ["state_changed", "lock_state_changed", "speech_recognized", "chat_message", "tts_started", "tts_completed", "tts_interrupted"], reason = "Молчит, пока идёт разговор, Астра говорит или экран заблокирован; запоминает имя её инструмента экрана." }
 send_chat_message = { reason = "Просит Астру самой начать разговор: отвечает её модель, голосом и характером." }
 
 [platform]
@@ -28,6 +29,20 @@ schema = """
 {
   "type": "object",
   "properties": {
+    "talk_level": {
+      "type": "string",
+      "maxLength": 30,
+      "enum": [
+        "по моим настройкам",
+        "часто",
+        "очень часто"
+      ],
+      "default": "очень часто",
+      "title": "Общее: как часто говорить",
+      "description": "«Часто»: до 12 сообщений в день; «очень часто»: до 30, болтает каждые ~25 минут.",
+      "x-astra-group": "general",
+      "x-astra-group-label": "Общее"
+    },
     "character": {
       "type": "string",
       "maxLength": 1200,
@@ -43,6 +58,29 @@ schema = """
       "default": true,
       "title": "Общее: озвучивать",
       "description": "Астра произносит своё сообщение вслух.",
+      "x-astra-group": "general",
+      "x-astra-group-label": "Общее"
+    },
+    "show_widget": {
+      "type": "boolean",
+      "default": true,
+      "title": "Общее: плашка со счётчиком",
+      "description": "Маленькая плашка поверх окна: что и когда дальше. Не мешает кликам.",
+      "x-astra-group": "general",
+      "x-astra-group-label": "Общее"
+    },
+    "widget_place": {
+      "type": "string",
+      "maxLength": 30,
+      "enum": [
+        "внизу справа",
+        "внизу слева",
+        "вверху справа",
+        "вверху слева"
+      ],
+      "default": "внизу справа",
+      "title": "Общее: где плашка",
+      "description": "Угол окна Astra. Применяется после перезапуска плагина.",
       "x-astra-group": "general",
       "x-astra-group-label": "Общее"
     },
@@ -162,6 +200,117 @@ schema = """
       "x-astra-group": "night",
       "x-astra-group-label": "Ночь"
     },
+    "enable_chat": {
+      "type": "boolean",
+      "default": false,
+      "title": "События: болтать между делом",
+      "description": "Лёгкий разговор, если давно не общались и вы за компьютером.",
+      "x-astra-group": "events",
+      "x-astra-group-label": "События"
+    },
+    "chat_every_min": {
+      "type": "integer",
+      "minimum": 10,
+      "maximum": 480,
+      "default": 60,
+      "title": "События: болтать раз в (мин)",
+      "description": "Не чаще, чем раз в столько минут.",
+      "x-astra-group": "events",
+      "x-astra-group-label": "События"
+    },
+    "enable_return": {
+      "type": "boolean",
+      "default": true,
+      "title": "События: поздороваться, когда вернулся",
+      "description": "После долгого отсутствия за компьютером, мышь или клавиатура.",
+      "x-astra-group": "events",
+      "x-astra-group-label": "События"
+    },
+    "return_hours": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 24,
+      "default": 3,
+      "title": "События: сколько часов отсутствия",
+      "description": "Меньше этого «вернулся» не считается.",
+      "x-astra-field-type": "slider",
+      "x-astra-group": "events",
+      "x-astra-group-label": "События"
+    },
+    "enable_break": {
+      "type": "boolean",
+      "default": true,
+      "title": "События: предложить перерыв",
+      "description": "Если долго сидите без пауз. Нужна проверка мыши и клавиатуры.",
+      "x-astra-group": "events",
+      "x-astra-group-label": "События"
+    },
+    "break_minutes": {
+      "type": "integer",
+      "minimum": 30,
+      "maximum": 480,
+      "default": 120,
+      "title": "События: перерыв через (мин)",
+      "description": "Сколько сидеть подряд, прежде чем предложить размяться.",
+      "x-astra-group": "events",
+      "x-astra-group-label": "События"
+    },
+    "enable_lunch": {
+      "type": "boolean",
+      "default": false,
+      "title": "События: спросить про обед",
+      "description": "Раз в день, пока вы за компьютером.",
+      "x-astra-group": "events",
+      "x-astra-group-label": "События"
+    },
+    "lunch_hour": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 23,
+      "default": 13,
+      "title": "События: обед с (час)",
+      "description": "Окно длится 2 часа.",
+      "x-astra-field-type": "slider",
+      "x-astra-group": "events",
+      "x-astra-group-label": "События"
+    },
+    "enable_friday": {
+      "type": "boolean",
+      "default": false,
+      "title": "События: поговорить в пятницу",
+      "description": "Как прошла неделя и планы на выходные.",
+      "x-astra-group": "events",
+      "x-astra-group-label": "События"
+    },
+    "friday_hour": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 23,
+      "default": 17,
+      "title": "События: пятница с (час)",
+      "description": "Окно длится 3 часа.",
+      "x-astra-field-type": "slider",
+      "x-astra-group": "events",
+      "x-astra-group-label": "События"
+    },
+    "enable_game": {
+      "type": "boolean",
+      "default": false,
+      "title": "События: заметить игру",
+      "description": "Если известная игра запущена давно. Только имя программы.",
+      "x-astra-group": "events",
+      "x-astra-group-label": "События"
+    },
+    "game_minutes": {
+      "type": "integer",
+      "minimum": 20,
+      "maximum": 360,
+      "default": 90,
+      "title": "События: игра длится (мин)",
+      "description": "Сколько играть, прежде чем Астра заметит.",
+      "x-astra-group": "events",
+      "x-astra-group-label": "События"
+    },
     "enable_silence": {
       "type": "boolean",
       "default": true,
@@ -278,61 +427,34 @@ schema = """
       "x-astra-group": "quiet",
       "x-astra-group-label": "Тишина"
     },
-    "look_at_screen": {
-      "type": "boolean",
-      "default": true,
-      "title": "Экран: учитывать, что у меня открыто",
-      "description": "Смотрит на экран, если умеет, иначе знает запущенные программы.",
-      "x-astra-group": "screen",
-      "x-astra-group-label": "Экран"
-    },
     "look_at_apps": {
       "type": "boolean",
       "default": true,
-      "title": "Экран: знать запущенные программы",
-      "description": "Только список известных программ, без снимков экрана.",
+      "title": "Приложения: опираться на открытые",
+      "description": "Астра видит, какая известная программа запущена, и обыгрывает её. Снимков нет.",
       "x-astra-group": "screen",
-      "x-astra-group-label": "Экран"
+      "x-astra-group-label": "Приложения"
     },
     "apps_hint_percent": {
       "type": "integer",
       "minimum": 0,
       "maximum": 100,
-      "default": 50,
-      "title": "Экран: как часто намекать (%)",
-      "description": "Доля сообщений с намёком на одну программу, не списком.",
+      "default": 80,
+      "title": "Приложения: как часто упоминать (%)",
+      "description": "Доля сообщений, где Астра упирается в одну открытую программу.",
       "x-astra-field-type": "slider",
       "x-astra-group": "screen",
-      "x-astra-group-label": "Экран"
-    },
-    "screen_tool": {
-      "type": "string",
-      "maxLength": 80,
-      "default": "",
-      "title": "Экран: имя инструмента снимка",
-      "description": "Если Астра умеет снимать экран, впишите имя. Пусто: запомнится само.",
-      "x-astra-group": "screen",
-      "x-astra-group-label": "Экран"
-    },
-    "screen_style": {
-      "type": "string",
-      "maxLength": 400,
-      "default": "Поприветствуй как обычно, а потом по-доброму подколи и спроси про увиденное, например: «что ты опять смотришь?» или «опять этим занимаешься?». Без нравоучений и без злости.",
-      "title": "Экран: как реагировать",
-      "description": "Тон, когда Астра смотрит на экран.",
-      "x-astra-field-type": "textarea",
-      "x-astra-group": "screen",
-      "x-astra-group-label": "Экран"
+      "x-astra-group-label": "Приложения"
     },
     "screen_privacy": {
       "type": "string",
       "maxLength": 400,
       "default": "Не упоминай и не пересказывай личное: переписки, почту, пароли, банки, сообщения других людей.",
-      "title": "Экран: о чём молчать",
+      "title": "Приложения: о чём молчать",
       "description": "Что не упоминать из увиденного.",
       "x-astra-field-type": "textarea",
       "x-astra-group": "screen",
-      "x-astra-group-label": "Экран"
+      "x-astra-group-label": "Приложения"
     },
     "test_mode": {
       "type": "boolean",
@@ -369,6 +491,48 @@ schema = """
       "type": "boolean",
       "default": false,
       "title": "Тест: ночь",
+      "x-astra-group": "test",
+      "x-astra-group-label": "Тест"
+    },
+    "test_chat": {
+      "type": "boolean",
+      "default": false,
+      "title": "Тест: беседа",
+      "x-astra-group": "test",
+      "x-astra-group-label": "Тест"
+    },
+    "test_return": {
+      "type": "boolean",
+      "default": false,
+      "title": "Тест: возвращение",
+      "x-astra-group": "test",
+      "x-astra-group-label": "Тест"
+    },
+    "test_break": {
+      "type": "boolean",
+      "default": false,
+      "title": "Тест: перерыв",
+      "x-astra-group": "test",
+      "x-astra-group-label": "Тест"
+    },
+    "test_lunch": {
+      "type": "boolean",
+      "default": false,
+      "title": "Тест: обед",
+      "x-astra-group": "test",
+      "x-astra-group-label": "Тест"
+    },
+    "test_friday": {
+      "type": "boolean",
+      "default": false,
+      "title": "Тест: пятница",
+      "x-astra-group": "test",
+      "x-astra-group-label": "Тест"
+    },
+    "test_game": {
+      "type": "boolean",
+      "default": false,
+      "title": "Тест: игра",
       "x-astra-group": "test",
       "x-astra-group-label": "Тест"
     },

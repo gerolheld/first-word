@@ -27,7 +27,7 @@ def _data_dir(tmp_path, monkeypatch):
 
 def make(**cfg) -> FirstWord:
     p = FirstWord()
-    p.cfg = {**mod.DEFAULTS, **cfg}
+    p.cfg = {**mod.DEFAULTS, "screen_tool": "", **cfg}          # по умолчанию имя пустое: тесты проверяют и обучение
     p._loaded = True
     p.host = RecordingHost()
     p._apps_fn = lambda: ([], "")                             # настоящий список приложений в тестах не читаем
@@ -41,7 +41,7 @@ NOON = datetime(2026, 10, 12, 10, 0)  # понедельник, утро, не �
 
 def test_tools_are_registered():
     with Harness(FirstWord()) as h:
-        assert h.tool_names() == ["check_presence", "initiative_status", "pause_initiative", "remember_topic", "resume_initiative", "trigger_now"]
+        assert [n for n in h.tool_names() if n != "describe_screen"] == ["check_presence", "initiative_status", "next_event", "pause_initiative", "remember_topic", "resume_initiative", "trigger_now"]
         h.assert_schema_accepts("pause_initiative", "duration")
 
 
@@ -67,7 +67,7 @@ def test_no_config_the_daemon_can_deliver_crashes_this_plugin():
 
 def test_garbage_config_falls_back_to_defaults():
     p = FirstWord()
-    asyncio.run(p.on_config_changed({"daily_limit": "много", "quiet_start": 99, "dry_run": 1, "character": 5}))
+    asyncio.run(p.on_config_changed({"talk_level": "по моим настройкам", "daily_limit": "много", "quiet_start": 99, "dry_run": 1, "character": 5}))
     assert p.cfg["daily_limit"] == 4
     assert p.cfg["quiet_start"] == 23
     assert p.cfg["dry_run"] is False
@@ -605,8 +605,8 @@ def test_a_whole_day_on_a_fake_clock():
 
 # ── v2: взгляд на экран ──────────────────────────────────────────────────
 
-def test_screen_look_is_off_by_default():
-    p = make()
+def test_screen_look_can_be_switched_off():
+    p = make(look_at_screen=False)
     for kind in ("ночь", "молчание", "мысль", "вечер", "своё", "утро"):
         assert "СНАЧАЛА посмотри на экран" not in p._compose(NOON, "тема", kind)
 
@@ -619,9 +619,9 @@ def test_screen_look_is_off_by_default():
 
 def test_screen_text_config_is_clamped():
     p = FirstWord()
-    asyncio.run(p.on_config_changed({"screen_privacy": "я" * 5000, "screen_style": "ы" * 5000, "look_at_screen": "да"}))
-    assert len(p.cfg["screen_privacy"]) == 400 and len(p.cfg["screen_style"]) == 400
-    assert p.cfg["look_at_screen"] is True                       # мусор вместо булевого значения: берём значение по умолчанию
+    asyncio.run(p.on_config_changed({"screen_privacy": "я" * 5000, "look_at_apps": "да"}))
+    assert len(p.cfg["screen_privacy"]) == 400
+    assert p.cfg["look_at_apps"] is True                         # мусор вместо булевого значения: берём значение по умолчанию
 
 
 # ── 0.1.2: проверка присутствия ──────────────────────────────────────────
@@ -701,7 +701,7 @@ def test_recent_activity_skips_the_mouse_check():
     p, clock, sent = presence_plugin()
     p._last_activity = clock[0] - 30                              # только что разговаривали или разблокировали
     assert asyncio.run(p._tick()) is None and len(sent) == 1
-    assert p.backend_.calls == 0
+    assert p._pw["base"] is None                                   # проверка «на месте ли» не начиналась
 
 
 def test_presence_check_can_be_switched_off_and_a_missing_backend_does_not_block():
@@ -996,13 +996,12 @@ def test_the_test_blocks_real_initiatives_while_it_runs_and_shows_in_status(monk
 def test_dry_run_test_only_writes_prompts_to_the_log(monkeypatch, caplog):
     import logging
     monkeypatch.setattr(mod.asyncio, "sleep", _no_sleep)
-    p, clock, sent = plugin_in_test_mode(dry_run=True, test_morning=True, test_silence=True, look_at_screen=True,
-                                         screen_tool="screen_capture")
+    p, clock, sent = plugin_in_test_mode(dry_run=True, test_morning=True, test_silence=True)
     asyncio.run(p.on_config_changed(p.cfg))
     with caplog.at_level(logging.INFO, logger="first-word"):
         _run_ticks(p, clock)
     msgs = [r.getMessage() for r in caplog.records if "[пробный режим] тест" in r.getMessage()]
-    assert not sent and len(msgs) == 2 and "СНАЧАЛА посмотри на экран" in msgs[0] and "«screen_capture»" in msgs[0]
+    assert not sent and len(msgs) == 2 and "Служебная подсказка" in msgs[0]
 
 
 def test_custom_prompts_are_tested_without_regard_to_their_time(monkeypatch):
@@ -1049,48 +1048,12 @@ def _schema():
 
 
 
-def test_the_tool_name_is_learned_from_a_started_tool_and_settings_win():
-    p = make(look_at_screen=True)
-    for payload, expected in [
-        ({"name": "screen_capture"}, "screen_capture"),
-        ({"tool_name": "get_screenshot"}, "get_screenshot"),
-        ({"tool": "Сделать_скриншот"}, "Сделать_скриншот"),
-        ({"tool": {"name": "desktop_screenshot"}}, "desktop_screenshot"),
-    ]:
-        p.state.pop("screen_tool_seen", None)
-        p._handle("tool_started", payload)
-        assert p.state["screen_tool_seen"] == expected, payload
-    assert "«desktop_screenshot»" in p._compose(NOON, "т", "ночь")
-    p.cfg["screen_tool"] = "мой_инструмент"
-    assert "«мой_инструмент»" in p._compose(NOON, "т", "ночь") and "desktop_screenshot" not in p._compose(NOON, "т", "ночь")
-
-
 def test_unrelated_tools_and_our_own_are_not_taken_for_the_screen_tool():
     p = make(look_at_screen=True)
     for name in ("web_search", "pause_initiative", "trigger_now", "check_presence", "remember_topic", "x" * 200):
         p._handle("tool_started", {"name": name})
     p._handle("tool_started", {"arguments": "скриншот экрана"})         # в аргументах не ищем
     assert "screen_tool_seen" not in p.state
-
-
-def test_first_tool_event_is_logged_by_keys_only_so_arguments_do_not_leak(caplog):
-    import logging
-    p = make()
-    with caplog.at_level(logging.INFO, logger="first-word"):
-        p._handle("tool_started", {"name": "web_search", "arguments": {"q": "мой секретный запрос"}})
-    text = " ".join(r.getMessage() for r in caplog.records)
-    assert "первое событие tool_started" in text and "arguments" in text and "секретный" not in text
-
-
-
-
-def test_the_manifest_asks_for_tool_started_and_the_code_subscribes_to_it():
-    import tomllib
-    toml = tomllib.loads((Path(__file__).resolve().parent.parent / "plugin.toml").read_text(encoding="utf-8"))
-    types = toml["permissions"]["subscribe_events"]["types"]
-    assert "tool_started" in types
-    assert set(FirstWord().subscribed_events()) <= set(types)             # кодом не просим больше, чем в манифесте
-    assert len(toml["permissions"]["subscribe_events"]["reason"]) <= 140
 
 
 # ── 0.1.2: приказ смотреть на экран только при известном инструменте, иначе список приложений ──
@@ -1102,29 +1065,6 @@ def with_apps(p, labels=("браузер", "Steam", "Discord"), foreground=""):
     p.cfg["apps_hint_percent"] = 100                                                  # в тестах намёк всегда есть
     p._apps_cache = (p.clock(), list(labels), foreground)
     return p
-
-
-def test_screen_order_is_given_only_when_the_tool_name_is_known():
-    p = make(look_at_screen=True, screen_tool="screen_capture", screen_privacy="Не называй банки.",
-             screen_style="Подколи меня.")
-    for kind in ALL_KINDS:
-        out = p._compose(NOON, "тема", kind)
-        assert "СНАЧАЛА посмотри на экран" in out and "«screen_capture»" in out
-        assert "Это обязательно, не отвечай до вызова" in out and "дождись результата" in out
-        assert "Подколи меня." in out and "Не называй банки." in out
-        assert "если у тебя есть такая возможность" not in out
-    assert "СНАЧАЛА посмотри на экран" not in p._compose(NOON, "тема")                # вид сценария не задан
-    assert "СНАЧАЛА посмотри на экран" not in make(look_at_screen=False, look_at_apps=False, screen_tool="x")._compose(NOON, "т", "утро")   # выключено
-
-
-
-
-
-
-
-
-
-
 
 
 def test_apps_are_refreshed_in_the_background_cached_and_failures_are_survived():
@@ -1196,11 +1136,11 @@ def test_the_linux_scan_reads_only_own_processes_and_returns_names(monkeypatch, 
     assert {"firefox", "discord"} <= names and "chrome" not in names                   # чужой процесс не читаем
 
 
-def test_without_a_tool_name_no_order_is_sent_but_one_app_hint_is_given_instead_of_a_list():
-    p = with_apps(make(look_at_screen=True))
+def test_the_app_hint_is_one_app_and_not_a_list():
+    p = with_apps(make(look_at_apps=True))
+    p.cfg["apps_hint_percent"] = 100
     out = p._compose(NOON, "тема", "утро")
-    assert "СНАЧАЛА" not in out and "вызови инструмент снимка экрана" not in out
-    assert "Необязательный намёк" in out
+    assert "Опорная деталь" in out and "ядром фразы" in out and "НИКОГДА не перечисляй" in out
     mentioned = [a for a in ("браузер", "Steam", "Discord") if f"запущено: {a}." in out]
     assert len(mentioned) == 1                                                        # одно приложение, не список
 
@@ -1216,16 +1156,11 @@ def test_the_hint_never_enumerates_and_forbids_enumerating():
 
 
 def test_the_foreground_app_is_preferred_and_a_style_about_looking_is_not_added_to_an_app_hint():
-    p = with_apps(make(look_at_apps=True, screen_style="Спроси, что ты опять смотришь.", screen_privacy="Не называй банки."),
+    p = with_apps(make(look_at_apps=True, look_at_screen=False, screen_style="Спроси, что ты опять смотришь.", screen_privacy="Не называй банки."),
                   foreground="браузер")
     out = p._compose(NOON, "тема", "ночь")
     assert "запущено: браузер." in out and "Не называй банки." in out
     assert "что ты опять смотришь" not in out                                         # тон про экран нужен только снимку
-
-
-def test_the_style_is_kept_for_a_real_screenshot_tool():
-    out = make(look_at_screen=True, screen_tool="screen_capture", screen_style="Подколи меня.")._compose(NOON, "т", "утро")
-    assert "«screen_capture»" in out and "Подколи меня." in out
 
 
 def test_the_hint_appears_only_as_often_as_configured_and_never_with_nothing_to_say():
@@ -1235,24 +1170,14 @@ def test_the_hint_appears_only_as_often_as_configured_and_never_with_nothing_to_
         rnd.seed(seed)
         p = with_apps(make(look_at_apps=True))
         p.cfg["apps_hint_percent"] = 50
-        hits += "Необязательный намёк" in p._compose(NOON, "т", "утро")
+        hits += "Опорная деталь" in p._compose(NOON, "т", "утро")
     assert 140 < hits < 260                                                           # около половины
     p = with_apps(make(look_at_apps=True))
     p.cfg["apps_hint_percent"] = 0
-    assert "Необязательный намёк" not in p._compose(NOON, "т", "утро")
-    assert "Необязательный намёк" not in with_apps(make(look_at_apps=True), labels=())._compose(NOON, "т", "утро")
-    assert "Необязательный намёк" not in with_apps(make(look_at_screen=False, look_at_apps=False))._compose(NOON, "т", "утро")  # выключено
-    assert "Необязательный намёк" not in with_apps(make(look_at_apps=True))._compose(NOON, "т")  # вид не задан
-
-
-def test_tool_and_apps_hint_can_work_together():
-    out = with_apps(make(look_at_screen=True, look_at_apps=True, screen_tool="screen_capture"))._compose(NOON, "т", "утро")
-    assert "«screen_capture»" in out and "Необязательный намёк" in out
-
-
-def test_a_known_tool_alone_does_not_add_an_apps_hint():
-    out = with_apps(make(look_at_screen=True, look_at_apps=False, screen_tool="screen_capture"))._compose(NOON, "т", "утро")
-    assert "«screen_capture»" in out and "Необязательный намёк" not in out
+    assert "Опорная деталь" not in p._compose(NOON, "т", "утро")
+    assert "Опорная деталь" not in with_apps(make(look_at_apps=True), labels=())._compose(NOON, "т", "утро")
+    assert "Опорная деталь" not in with_apps(make(look_at_apps=False))._compose(NOON, "т", "утро")  # выключено
+    assert "Опорная деталь" not in with_apps(make(look_at_apps=True))._compose(NOON, "т")  # вид не задан
 
 
 def test_a_real_initiative_fetches_the_apps_before_it_composes_the_prompt():
@@ -1262,16 +1187,12 @@ def test_a_real_initiative_fetches_the_apps_before_it_composes_the_prompt():
     assert len(sent) == 1 and "запущено: Steam." in sent[0]
 
 
-def test_status_explains_what_astra_is_given_about_the_screen():
-    p = make(look_at_screen=True, look_at_apps=False)
+def test_status_explains_which_apps_astra_leans_on():
+    p = make(look_at_apps=True)
+    p._apps_cache = (p.clock(), ["браузер", "Steam"], "")
     out = asyncio.run(p.initiative_status())
-    assert "не найден" in out and "приказ «посмотри на экран» не отправляется" in out
-    assert "по одному, списком не передаются" in out and "пока не определено" in out
-    p._handle("tool_started", {"name": "screen_capture"})
-    out = asyncio.run(p.initiative_status())
-    assert "Инструмент экрана: «screen_capture»" in out and "по одному" not in out
-    assert "Инструмент экрана" not in asyncio.run(make(look_at_screen=False, look_at_apps=False).initiative_status())   # выключено: молчим
-    assert "в 100% инициатив" in asyncio.run(with_apps(make(look_at_apps=True)).initiative_status())
+    assert "браузер, Steam" in out and "по одному, списком не передаются" in out
+    assert "Приложения, из которых" not in asyncio.run(make(look_at_apps=False).initiative_status())   # выключено: молчим
 
 
 # ── личность Астры ───────────────────────────────────────────────────────
@@ -1335,7 +1256,7 @@ def test_sliders_are_only_on_bounded_integers_and_textareas_only_on_strings():
 
 def test_float_values_from_a_slider_are_accepted_as_whole_numbers():
     p = FirstWord()
-    asyncio.run(p.on_config_changed({"morning_hour": 7.0, "daily_limit": 5.6, "random_chance_percent": 33.3}))
+    asyncio.run(p.on_config_changed({"talk_level": "по моим настройкам", "morning_hour": 7.0, "daily_limit": 5.6, "random_chance_percent": 33.3}))
     assert (p.cfg["morning_hour"], p.cfg["daily_limit"], p.cfg["random_chance_percent"]) == (7, 5, 33)
 
 
@@ -1358,7 +1279,7 @@ def test_float_values_from_a_slider_are_accepted_as_whole_numbers():
 
 # ── форма настроек: все поля на месте, понятные и по порядку ─────────────
 
-GROUP_ORDER = ["general", "morning", "evening", "night", "silence", "random", "custom", "quiet", "screen", "test"]
+GROUP_ORDER = ["general", "morning", "evening", "night", "events", "silence", "random", "custom", "quiet", "screen", "test"]
 
 
 def test_every_setting_is_in_the_form_and_agrees_with_the_code():
@@ -1391,7 +1312,7 @@ def test_hints_are_one_short_line_and_every_non_obvious_setting_has_one():
         assert len(p.get("description", "")) <= 90, key
         assert "\n" not in p.get("description", ""), key
     for key in ("character", "daily_limit", "enable_morning", "morning_until", "enable_night", "enable_silence",
-                "custom_prompts", "presence_check", "look_at_screen", "look_at_apps", "screen_tool", "test_mode", "dry_run"):
+                "custom_prompts", "presence_check", "look_at_apps", "apps_hint_percent", "test_mode", "dry_run"):
         assert props[key].get("description"), f"у {key} нет пояснения"
 
 
@@ -1405,7 +1326,7 @@ def test_sections_come_in_a_logical_order_and_are_never_split():
             order.append(gid)
     assert order == GROUP_ORDER
     keys = list(_schema())
-    assert keys[0] == "character" and keys[-1] == "dry_run"                           # главное сверху, отладка снизу
+    assert keys[0] == "talk_level" and keys[-1] == "dry_run"                           # главное сверху, отладка снизу
 
 
 def test_each_scenario_switch_is_followed_by_its_own_time_setting():
@@ -1413,7 +1334,7 @@ def test_each_scenario_switch_is_followed_by_its_own_time_setting():
     for switch, knob in [("enable_morning", "morning_hour"), ("enable_evening", "evening_hour"),
                          ("enable_night", "night_hour"), ("enable_silence", "silence_hours"),
                          ("enable_random", "random_chance_percent"), ("quiet_enabled", "quiet_start"),
-                         ("presence_check", "presence_check_sec"), ("look_at_screen", "look_at_apps")]:
+                         ("presence_check", "presence_check_sec")]:
         assert 0 < keys.index(knob) - keys.index(switch) <= 3, (switch, knob)
 
 
@@ -1424,50 +1345,43 @@ def test_time_and_small_numbers_are_sliders_and_long_texts_are_textareas():
                 "after_chat_pause_min", "presence_check_sec", "apps_hint_percent"):
         assert props[key]["x-astra-field-type"] == "slider", key
         assert props[key]["maximum"] - props[key]["minimum"] <= 120, key
-    for key in ("character", "custom_prompts", "screen_style", "screen_privacy"):
+    for key in ("character", "custom_prompts", "screen_privacy"):
         assert props[key]["x-astra-field-type"] == "textarea", key
     for key in ("test_time", "min_interval_min", "presence_max_sec", "test_gap_sec"):
         assert "x-astra-field-type" not in props[key], key                           # широкий диапазон или текст
 
 
-def test_the_six_test_switches_are_back_and_each_maps_to_a_scenario():
+def test_the_test_switches_are_back_and_each_maps_to_a_scenario():
     props = _schema()
     for flag, kind in mod.TEST_FLAGS:
         assert flag in props and props[flag]["type"] == "boolean", flag
         assert props[flag]["title"].startswith("Тест: "), flag
-    assert [k for _, k in mod.TEST_FLAGS] == ["утро", "вечер", "ночь", "молчание", "мысль", "своё"]
+    assert [k for _, k in mod.TEST_FLAGS] == [
+        "утро", "вечер", "ночь", "беседа", "возвращение", "перерыв", "обед", "пятница", "игра", "молчание", "мысль", "своё"]
     assert "test_event" not in props
 
 
 # ── просмотр экрана и приложений включён по умолчанию ────────────────────
 
-def test_screen_and_apps_are_on_by_default_in_code_and_in_the_form():
-    assert mod.DEFAULTS["look_at_screen"] is True and mod.DEFAULTS["look_at_apps"] is True
+def test_apps_are_on_by_default_in_code_and_in_the_form_and_the_screen_settings_are_gone():
+    assert mod.DEFAULTS["look_at_apps"] is True and mod.DEFAULTS["apps_hint_percent"] == 80
     props = _schema()
-    assert props["look_at_screen"]["default"] is True and props["look_at_apps"]["default"] is True
+    assert props["look_at_apps"]["default"] is True
+    for gone in ("look_at_screen", "screen_tool", "screen_style", "screen_question"):
+        assert gone not in props and gone not in mod.DEFAULTS
 
 
-def test_a_fresh_install_gives_astra_a_hint_without_touching_any_setting():
+def test_a_fresh_install_gives_astra_an_app_to_lean_on_and_no_screen_order():
     p = FirstWord()
     asyncio.run(p.on_config_changed({}))                              # первая конфигурация новой установки пустая
-    assert p.cfg["look_at_screen"] is True and p.cfg["look_at_apps"] is True
+    assert p.cfg["look_at_apps"] is True
     p._apps_fn = lambda: (["Steam"], "")
     p.cfg["apps_hint_percent"] = 100
     asyncio.run(p._refresh_apps())
     out = p._compose(NOON, "тема", "утро")
     assert "запущено: Steam." in out and "НИКОГДА не перечисляй программы" in out
-    assert "СНАЧАЛА посмотри на экран" not in out                      # имени инструмента нет: приказа нет, зря не ищем
-
-
-def test_by_default_a_learned_screen_tool_is_ordered_and_the_apps_hint_is_added_too():
-    p = FirstWord()
-    asyncio.run(p.on_config_changed({}))
-    p.cfg["apps_hint_percent"] = 100
-    p._apps_fn = lambda: (["браузер"], "")
-    p._handle("tool_started", {"name": "screen_capture"})
-    asyncio.run(p._refresh_apps())
-    out = p._compose(NOON, "тема", "ночь")
-    assert "«screen_capture»" in out and "запущено: браузер." in out
+    for gone in ("СНАЧАЛА", "read_image", "tool_search", "снимок"):
+        assert gone not in out
 
 
 def test_a_user_can_still_switch_both_off():
@@ -1479,11 +1393,341 @@ def test_a_user_can_still_switch_both_off():
     assert "СНАЧАЛА" not in out and "Необязательный намёк" not in out
 
 
-def test_with_both_on_by_default_the_status_shows_the_tool_and_the_apps_it_hints_from():
+def test_the_manifest_no_longer_asks_for_tool_events():
+    import tomllib
+    toml = tomllib.loads((Path(__file__).resolve().parent.parent / "plugin.toml").read_text(encoding="utf-8"))
+    assert "tool_started" not in toml["permissions"]["subscribe_events"]["types"]
+    assert "tool_started" not in FirstWord().subscribed_events()
+
+
+# ── 0.2.0: новые сценарии ────────────────────────────────────────────────
+
+def events_plugin(hour=10, weekday_shift=0, **cfg):
+    """Плагин на подставных часах и мыши без других сценариев: проверяем по одному новому."""
+    base = dict(enable_morning=False, enable_night=False, enable_silence=False, enable_random=False,
+                enable_return=False, enable_break=False, quiet_enabled=False, min_interval_min=0,
+                after_chat_pause_min=0, presence_check_sec=5)
+    p = make(**{**base, **cfg})
+    p.backend_ = FakeBackend()
+    p._backend = p.backend_
+    clock = [datetime(2026, 10, 12 + weekday_shift, hour, 0).timestamp()]      # 12.10.2026 — понедельник
+    p.clock = lambda: clock[0]
+    sent = []
+    p.host.send_chat_message = lambda text, **kw: (sent.append(text), stream_of("привет"))[1]
+    return p, clock, sent
+
+
+def move(p):
+    p.backend_.token = (p.backend_.token[0] + 1, 0)
+
+
+def tick(p, clock, seconds=20):
+    clock[0] += seconds
+    return asyncio.run(p._tick())
+
+
+def test_new_scenarios_defaults_and_names():
+    d = mod.DEFAULTS
+    assert d["enable_return"] is True and d["enable_break"] is True
+    assert d["enable_lunch"] is False and d["enable_friday"] is False and d["enable_game"] is False
+    for word, kind in (("return", "возвращение"), ("break", "перерыв"), ("lunch", "обед"),
+                       ("friday", "пятница"), ("game", "игра")):
+        assert mod.KINDS[word] == kind and mod.KINDS[kind] == kind
+
+
+def test_coming_back_after_a_long_absence_gets_a_greeting_once():
+    p, clock, sent = events_plugin(enable_return=True, return_hours=3)
+    tick(p, clock); move(p); tick(p, clock)                       # человек сидит
+    assert not sent
+    clock[0] += 4 * 3600                                          # ушёл на четыре часа
+    tick(p, clock)
+    assert not sent
+    move(p); tick(p, clock)                                       # вернулся
+    assert len(sent) == 1 and "вернулся" in sent[0]
+    move(p); tick(p, clock)
+    assert len(sent) == 1
+
+
+def test_a_short_gap_is_not_a_return():
+    p, clock, sent = events_plugin(enable_return=True, return_hours=3)
+    tick(p, clock); move(p); tick(p, clock)
+    clock[0] += 3600
+    move(p); tick(p, clock)
+    assert not sent
+
+
+def test_return_window_expires():
+    p, clock, sent = events_plugin(enable_return=True, return_hours=1, daily_limit=0)
+    tick(p, clock); move(p); tick(p, clock)
+    clock[0] += 2 * 3600
+    move(p); tick(p, clock)
+    assert p._return_at
+    p.cfg["daily_limit"] = 4
+    clock[0] += 20 * 60
+    tick(p, clock)
+    assert not sent and p._return_at == 0.0
+
+
+def test_a_break_is_suggested_after_long_continuous_sitting_and_not_again_at_once():
+    p, clock, sent = events_plugin(enable_break=True, break_minutes=60)
+    for _ in range(64):                                           # минута за минутой есть ввод
+        move(p); tick(p, clock, 60)
+    assert len(sent) == 1 and "перерыв" in sent[0]
+    for _ in range(30):
+        move(p); tick(p, clock, 60)
+    assert len(sent) == 1                                         # ещё не прошло полного периода после напоминания
+
+
+def test_a_pause_in_input_restarts_the_sitting_clock():
+    p, clock, sent = events_plugin(enable_break=True, break_minutes=60)
+    for _ in range(40):
+        move(p); tick(p, clock, 60)
+    clock[0] += 20 * 60                                           # отошёл на 20 минут
+    for _ in range(40):
+        move(p); tick(p, clock, 60)
+    assert not sent
+
+
+def test_break_needs_the_input_tracker():
+    p, clock, sent = events_plugin(enable_break=True, break_minutes=30, presence_check=False)
+    for _ in range(60):
+        tick(p, clock, 60)
+    assert not sent and p.backend_.calls == 0
+
+
+def test_lunch_once_a_day_in_its_window_and_only_when_present():
+    p, clock, sent = events_plugin(hour=12, enable_lunch=True, lunch_hour=13)
+    p._last_activity = clock[0]
+    tick(p, clock)
+    assert not sent                                               # ещё не обед
+    p2, clock2, sent2 = events_plugin(hour=13, enable_lunch=True, lunch_hour=13)
+    tick(p2, clock2)
+    assert not sent2                                              # обед, но никого нет
+    p2._last_activity = clock2[0]
+    tick(p2, clock2)
+    assert len(sent2) == 1 and "обед" in sent2[0]
+    tick(p2, clock2, 600)
+    assert len(sent2) == 1
+
+
+def test_friday_only_on_friday():
+    p, clock, sent = events_plugin(hour=18, enable_friday=True, friday_hour=17)
+    p._last_activity = clock[0]
+    tick(p, clock)
+    assert not sent                                               # понедельник
+    q, clock_q, sent_q = events_plugin(hour=18, weekday_shift=4, enable_friday=True, friday_hour=17)
+    q._last_activity = clock_q[0]
+    tick(q, clock_q)
+    assert len(sent_q) == 1 and "пятниц" in sent_q[0]
+
+
+def test_game_is_noticed_after_it_has_been_running_long_enough():
+    p, clock, sent = events_plugin(enable_game=True, game_minutes=30)
+    p._apps_fn = lambda: (["игра", "браузер"], "")
+    p._last_activity = clock[0]
+    for _ in range(25):
+        move(p); tick(p, clock, 60)
+    assert not sent
+    for _ in range(10):
+        move(p); tick(p, clock, 60)
+    assert len(sent) == 1 and "игр" in sent[0] and "браузер" not in sent[0]
+    for _ in range(20):
+        tick(p, clock, 60)
+    assert len(sent) == 1                                         # раз в день
+
+
+def test_game_timer_resets_when_the_game_closes():
+    p, clock, sent = events_plugin(enable_game=True, game_minutes=30)
+    names = [["игра"]]
+    p._apps_fn = lambda: (names[0], "")
+    p._last_activity = clock[0]
+    for _ in range(20):
+        tick(p, clock, 60)
+    names[0] = []
+    for _ in range(5):
+        tick(p, clock, 60)
+    names[0] = ["игра"]
+    for _ in range(25):
+        tick(p, clock, 60)
+    assert not sent
+
+
+def test_trigger_now_accepts_every_new_scenario():
+    for word in ("return", "break", "lunch", "friday", "game"):
+        p, clock, sent = events_plugin(hour=14)
+
+        async def go():
+            msg = await p.trigger_now(word)
+            await asyncio.sleep(0.05)
+            return msg
+        assert "Запускаю" in asyncio.run(go()), word
+
+
+# ── 0.2.0: снимок экрана и подсказка ─────────────────────────────────────
+
+def test_the_prompt_asks_for_short_replies_and_names_the_part_of_the_day():
+    p = make()
+    assert "около 25 слов" in p._compose(NOON, "т", "утро") and "утро" in p._compose(NOON, "т", "утро")
+    evening = datetime(2026, 10, 12, 20, 0)
+    assert "вечер" in p._compose(evening, "т", "вечер").split("\n")[1]
+    night = datetime(2026, 10, 13, 2, 0)
+    assert "ночь" in p._compose(night, "т", "ночь").split("\n")[1]
+
+
+# ── 0.2.0: счётчик до следующего события ─────────────────────────────────
+
+def countdown(hour=10, minute=0, weekday_shift=0, **cfg):
+    base = dict(enable_morning=False, enable_callback=False, enable_night=False, enable_silence=False,
+                enable_random=False, enable_return=False, enable_break=False, enable_evening=False,
+                quiet_enabled=False, min_interval_min=0)
+    p = make(**{**base, **cfg})
+    dt = datetime(2026, 10, 12 + weekday_shift, hour, minute)
+    p.clock = lambda: dt.timestamp()
+    return p, dt
+
+
+def test_countdown_names_the_nearest_event_with_time_left():
+    p, dt = countdown(enable_evening=True, evening_hour=21)
+    text = p.next_event_text(dt)
+    assert text.startswith("Следующее: «вечер» через 11 ч (в 21:00)")
+
+
+def test_countdown_orders_events_and_lists_the_rest():
+    p, dt = countdown(enable_evening=True, evening_hour=21, enable_lunch=True, lunch_hour=13)
+    text = p.next_event_text(dt)
+    assert text.startswith("Следующее: «обед» через 3 ч (в 13:00)") and "Потом: «вечер» через 11 ч" in text
+
+
+def test_countdown_moves_to_tomorrow_when_todays_window_is_over():
+    p, dt = countdown(hour=22, enable_evening=True, evening_hour=18)
+    assert "«вечер» через 20 ч (в 18:00 завтра)" in p.next_event_text(dt)
+
+
+def test_countdown_respects_the_gap_pause_and_quiet_hours():
+    p, dt = countdown(hour=9, minute=55, enable_lunch=True, lunch_hour=10, min_interval_min=90)
+    p.state["last_sent"] = dt.timestamp() - 10 * 60
+    text = p.next_event_text(dt)
+    assert "«обед» через 1 ч 20 мин (в 11:15)" in text
+    assert "Раньше не выйдет: пауза между сообщениями" in text
+    q, dtq = countdown(hour=2, enable_evening=True, evening_hour=3, quiet_enabled=True, quiet_start=1, quiet_end=8)
+    assert "(в 08:00)" in q.next_event_text(dtq) and "тихими часами" in q.next_event_text(dtq)
+
+
+def test_countdown_daily_limit_and_pause():
+    p, dt = countdown(enable_evening=True, evening_hour=21, daily_limit=1)
+    p.state.update(day=dt.date().isoformat(), sent_today=1)
+    text = p.next_event_text(dt)
+    assert "дневной лимит" in text and "завтра" in text
+    p.state.update(day=dt.date().isoformat(), sent_today=0, pause_until=dt.timestamp() + 3600)
+    assert "Сейчас пауза до 11:00" in p.next_event_text(dt)
+
+
+def test_countdown_lists_conditional_scenarios_and_custom_reminders():
+    p, dt = countdown(enable_return=True, return_hours=3, custom_prompts="пн-пт 18:00 выпей воды")
+    text = p.next_event_text(dt)
+    assert "«своё» через 8 ч (в 18:00)" in text and "«возвращение», когда вернётесь после 3 ч" in text
+
+
+def test_countdown_with_nothing_enabled_and_friday_lookup():
+    p, dt = countdown()
+    assert p.next_event_text(dt) == "Ни один сценарий не включён, ждать нечего."
+    q, dtq = countdown(enable_friday=True, friday_hour=17)
+    assert "«пятница» через 4 д 7 ч (в 17:00 16.10)" in q.next_event_text(dtq) or "16.10" in q.next_event_text(dtq)
+
+
+def test_the_next_event_tool_and_status_use_it():
+    p, dt = countdown(enable_evening=True, evening_hour=21)
+    assert asyncio.run(p.next_event()).startswith("Следующее: «вечер»")
+    assert "Следующее: «вечер»" in asyncio.run(p.initiative_status())
+
+
+# ── 0.2.0: плашка со счётчиком ───────────────────────────────────────────
+
+def test_the_overlay_is_registered_and_its_page_ships_with_the_plugin():
+    contribs = asyncio.run(FirstWord().get_ui_contributions())
+    assert [(c.id, c.slot, c.url) for c in contribs] == [("first-word-countdown", "overlay.floating", "countdown.html")]
+    html = (Path(mod.__file__).resolve().parent.parent / "ui" / "countdown.html").read_text(encoding="utf-8")
+    assert 'callBackend("get_countdown"' in html and "astra-bridge.js" in html
+
+
+def test_countdown_data_for_the_widget():
+    p, dt = countdown(enable_evening=True, evening_hour=21, enable_lunch=True, lunch_hour=13)
+    d = p.countdown_data(dt)
+    assert d["visible"] and d["kind"] == "обед" and d["left"] == 3 * 3600 and d["at"] == "13:00"
+    assert d["more"][0]["kind"] == "вечер" and d["left_today"] == 4 and not d["paused"]
+
+
+def test_the_widget_can_be_hidden_and_shows_a_pause_and_conditions():
+    p, dt = countdown(enable_return=True, show_widget=False)
+    assert p.countdown_data(dt) == {"visible": False}
+    p.cfg["show_widget"] = True
+    p.state.update(day=dt.date().isoformat(), pause_until=dt.timestamp() + 600)
+    d = p.countdown_data(dt)
+    assert d["paused"] and "kind" not in d and d["cond"][0]["kind"] == "возвращение"
+
+
+def test_the_ui_call_returns_the_same_data():
+    p, dt = countdown(enable_evening=True, evening_hour=21)
+    assert asyncio.run(p.get_countdown())["visible"] is True
+
+
+# ── 0.2.0: «как часто говорить», беседа, место плашки ────────────────────
+
+def level_cfg(level, **raw):
     p = FirstWord()
-    asyncio.run(p.on_config_changed({}))
-    p._handle("tool_started", {"name": "screen_capture"})
-    p._apps_cache = (p.clock(), ["Steam", "браузер"], "")
-    out = asyncio.run(p.initiative_status())
-    assert "Инструмент экрана: «screen_capture»" in out
-    assert "Steam, браузер" in out and "по одному, списком не передаются" in out
+    asyncio.run(p.on_config_changed({"talk_level": level, **raw}))
+    return p.cfg
+
+
+def test_talk_level_defaults_to_the_users_own_settings():
+    cfg = level_cfg("по моим настройкам")
+    assert cfg["daily_limit"] == 4 and cfg["min_interval_min"] == 90 and cfg["enable_chat"] is False
+
+
+def test_often_and_very_often_raise_the_limits_but_never_lower_the_users_values():
+    often, very = level_cfg("часто"), level_cfg("очень часто")
+    assert often["daily_limit"] == 12 and often["min_interval_min"] == 40 and often["enable_chat"] is True
+    assert often["chat_every_min"] == 60 and often["adaptive"] is True
+    assert very["daily_limit"] == 30 and very["min_interval_min"] == 15 and very["chat_every_min"] == 25
+    assert very["adaptive"] is False and very["silence_hours"] == 1 and very["random_chance_percent"] == 100
+    strong = level_cfg("часто", daily_limit=20, min_interval_min=10, chat_every_min=15)
+    assert strong["daily_limit"] == 20 and strong["min_interval_min"] == 10 and strong["chat_every_min"] == 15
+
+
+def test_unknown_enum_values_fall_back_to_defaults():
+    cfg = level_cfg("тараторить", widget_place="посередине")
+    assert cfg["talk_level"] == "очень часто" and cfg["widget_place"] == "внизу справа"
+
+
+def test_chat_scenario_fires_when_present_and_quiet_for_long_enough_and_then_waits():
+    p, clock, sent = events_plugin(enable_chat=True, chat_every_min=30, min_interval_min=0)
+    p.state["last_interaction"] = clock[0] - 10 * 60
+    p._last_activity = clock[0]
+    tick(p, clock)
+    assert not sent                                               # всего 10 минут тишины
+    p.state["last_interaction"] = clock[0] - 40 * 60
+    tick(p, clock)
+    assert len(sent) == 1 and "непринуждённый" in sent[0]
+    tick(p, clock, 60)
+    assert len(sent) == 1                                         # свежая инициатива: ждём ещё 30 минут
+
+
+def test_chat_needs_the_user_to_be_around():
+    p, clock, sent = events_plugin(enable_chat=True, chat_every_min=30)
+    p.state["last_interaction"] = clock[0] - 5 * 3600
+    tick(p, clock)
+    assert not sent
+
+
+def test_chat_is_in_the_forecast_and_in_trigger_now():
+    p, dt = countdown(enable_chat=True, chat_every_min=45)
+    p.state["last_interaction"] = dt.timestamp()
+    assert "«беседа» через 45 мин" in p.next_event_text(dt)
+    assert mod.KINDS["chat"] == "беседа"
+
+
+def test_the_widget_reports_its_corner():
+    p, dt = countdown(enable_evening=True, evening_hour=21, widget_place="вверху слева")
+    assert p.countdown_data(dt)["place"] == "вверху слева"
+
+
